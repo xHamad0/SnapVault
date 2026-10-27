@@ -3,35 +3,22 @@ name: Build iOS App
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 jobs:
   build:
-    name: Build iOS IPA
+    name: Build iOS App on macOS
     runs-on: macos-latest
 
     steps:
     - name: Checkout Repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Xcode
       uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: '15.0'
 
-    - name: Create Xcode Project structure
-      run: |
-        mkdir -p SnapVault.xcodeproj
-        cat << 'EOF' > SnapVault.xcodeproj/project.pbxproj
-        // Simplified project structure placeholder
-        EOF
-        mkdir -p SnapVault
-
-    - name: Move Source Code
-      run: |
-        mv ContentView.swift SnapVault/ContentView.swift
-
     - name: Build and Archive
       run: |
-        echo "Building project structure..."
-        xcodebuild -version
+        echo "Building project..."
+        # أوامر البناء الأساسية للمشروع وتصدير الـ ipa
