@@ -487,7 +487,7 @@ struct DownloaderHomeView: View {
 
                 Section(header: Text("سجل العمليات المباشر")) {
                     ForEach(manager.statusLog, id: \.self) { log in
-                        Text(log).font(.caption2, design: .monospaced).foregroundColor(.secondary)
+                        Text(log).font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
                     }
                 }
             }
