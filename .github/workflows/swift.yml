@@ -1,19 +1,85 @@
-name: Build iOS App
+name: Build iOS IPA
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Run Build Check
+    - name: Prepare App Structure & Entry Point
       run: |
-        echo "Environment is ready!"
-        xcodebuild -version
-        echo "Build workflow completed successfully."
+        mkdir -p Sources
+        if [ -f "ContentView.swift" ]; then
+          cp ContentView.swift Sources/
+        fi
+        
+        # إنشاء ملف تشغيل التطبيق الرئيسي تلقائياً إذا لم يكن موجوداً
+        if ! grep -q "@main" Sources/*.swift 2>/dev/null; then
+          cat << 'EOF' > Sources/SnapVaultApp.swift
+        import SwiftUI
+
+        @main
+        struct SnapVaultApp: App {
+            var body: some Scene {
+                WindowGroup {
+                    ContentView()
+                }
+            }
+        }
+        EOF
+        fi
+
+    - name: Generate Xcode Project via XcodeGen
+      run: |
+        cat << 'EOF' > project.yml
+        name: SnapVault
+        options:
+          bundleIdPrefix: com.xhamad0
+        targets:
+          SnapVault:
+            type: application
+            platform: iOS
+            deploymentTarget: "16.0"
+            sources:
+              - Sources
+            settings:
+              PRODUCT_BUNDLE_IDENTIFIER: com.xhamad0.snapvault
+              GENERATE_INFOPLIST_FILE: YES
+              INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+              INFOPLIST_KEY_UILaunchScreen_Generation: YES
+              INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+              CODE_SIGN_IDENTITY: ""
+              CODE_SIGNING_REQUIRED: NO
+              CODE_SIGNING_ALLOWED: NO
+        EOF
+        brew install xcodegen
+        xcodegen generate
+
+    - name: Build and Package IPA
+      run: |
+        xcodebuild -project SnapVault.xcodeproj \
+                   -scheme SnapVault \
+                   -sdk iphoneos \
+                   -configuration Release \
+                   -derivedDataPath build \
+                   CODE_SIGN_IDENTITY="" \
+                   CODE_SIGNING_REQUIRED=NO \
+                   CODE_SIGNING_ALLOWED=NO \
+                   clean build
+        
+        mkdir -p Payload
+        cp -r build/Build/Products/Release-iphoneos/SnapVault.app Payload/
+        zip -r SnapVault.ipa Payload
+
+    - name: Upload IPA Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SnapVault-IPA
+        path: SnapVault.ipa
