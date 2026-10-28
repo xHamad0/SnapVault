@@ -20,7 +20,6 @@ jobs:
           cp ContentView.swift Sources/
         fi
         
-        # إنشاء ملف تشغيل التطبيق الرئيسي تلقائياً إذا لم يكن موجوداً
         if ! grep -q "@main" Sources/*.swift 2>/dev/null; then
           cat << 'EOF' > Sources/SnapVaultApp.swift
         import SwiftUI
@@ -55,6 +54,8 @@ jobs:
               INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
               INFOPLIST_KEY_UILaunchScreen_Generation: YES
               INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+              INFOPLIST_KEY_NSFaceIDUsageDescription: "لحماية المحفوظات ببصمة الوجه"
+              INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "لحفظ المقاطع المختارة في ألبوم الصور"
               CODE_SIGN_IDENTITY: ""
               CODE_SIGNING_REQUIRED: NO
               CODE_SIGNING_ALLOWED: NO
