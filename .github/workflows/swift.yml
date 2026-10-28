@@ -35,6 +35,101 @@ jobs:
         EOF
         fi
 
+    - name: Generate Ghost App Icon
+      run: |
+        mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
+        cat << 'EOF' > generate_icon.swift
+        import AppKit
+
+        let size = CGSize(width: 1024, height: 1024)
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        guard let ctx = NSGraphicsContext.current?.cgContext else { exit(1) }
+
+        // 1. خلفية صفراء فاقعة (لون السناب)
+        ctx.setFillColor(CGColor(red: 1.0, green: 0.96, blue: 0.0, alpha: 1.0))
+        ctx.fill(CGRect(origin: .zero, size: size))
+
+        // 2. رسم جسم الشبح الأبيض مع حدود سوداء عريضة
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 260, y: 240))
+        path.addLine(to: CGPoint(x: 260, y: 580))
+        path.addArc(center: CGPoint(x: 512, y: 580), radius: 252, startAngle: .pi, endAngle: 0, clockwise: true)
+        path.addLine(to: CGPoint(x: 764, y: 240))
+        // تموجات الشبح من الأسفل
+        path.addQuadCurve(to: CGPoint(x: 638, y: 240), control: CGPoint(x: 701, y: 150))
+        path.addQuadCurve(to: CGPoint(x: 512, y: 240), control: CGPoint(x: 575, y: 310))
+        path.addQuadCurve(to: CGPoint(x: 386, y: 240), control: CGPoint(x: 449, y: 150))
+        path.addQuadCurve(to: CGPoint(x: 260, y: 240), control: CGPoint(x: 323, y: 310))
+        path.closeSubpath()
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -15), blur: 30, color: CGColor(gray: 0, alpha: 0.25))
+        ctx.addPath(path)
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        ctx.addPath(path)
+        ctx.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.setLineWidth(28)
+        ctx.setLineJoin(.round)
+        ctx.strokePath()
+
+        // 3. عيون الشبح
+        ctx.setFillColor(CGColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: 395, y: 570, width: 58, height: 82))
+        ctx.fillEllipse(in: CGRect(x: 571, y: 570, width: 58, height: 82))
+
+        // لمعة العيون
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: 408, y: 615, width: 20, height: 20))
+        ctx.fillEllipse(in: CGRect(x: 584, y: 615, width: 20, height: 20))
+
+        // 4. سهم التحميل الأسود وسط الشبح (يميز تطبيق SnapVault)
+        let arrow = CGMutablePath()
+        arrow.move(to: CGPoint(x: 482, y: 490))
+        arrow.addLine(to: CGPoint(x: 542, y: 490))
+        arrow.addLine(to: CGPoint(x: 542, y: 390))
+        arrow.addLine(to: CGPoint(x: 600, y: 390))
+        arrow.addLine(to: CGPoint(x: 512, y: 295))
+        arrow.addLine(to: CGPoint(x: 424, y: 390))
+        arrow.addLine(to: CGPoint(x: 482, y: 390))
+        arrow.closeSubpath()
+
+        ctx.addPath(arrow)
+        ctx.setFillColor(CGColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1))
+        ctx.fillPath()
+
+        image.unlockFocus()
+
+        if let tiff = image.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiff),
+           let png = bitmap.representation(using: .png, properties: [:]) {
+            try! png.write(to: URL(fileURLWithPath: "Sources/Assets.xcassets/AppIcon.appiconset/icon.png"))
+        }
+        EOF
+        swift generate_icon.swift
+        rm generate_icon.swift
+
+        cat << 'EOF' > Sources/Assets.xcassets/AppIcon.appiconset/Contents.json
+        {
+          "images" : [
+            {
+              "filename" : "icon.png",
+              "idiom" : "universal",
+              "platform" : "ios",
+              "size" : "1024x1024"
+            }
+          ],
+          "info" : {
+            "author" : "xcode",
+            "version" : 1
+          }
+        }
+        EOF
+
     - name: Generate Xcode Project via XcodeGen
       run: |
         cat << 'EOF' > project.yml
@@ -50,6 +145,7 @@ jobs:
               - Sources
             settings:
               PRODUCT_BUNDLE_IDENTIFIER: com.xhamad0.snapvault
+              ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
               GENERATE_INFOPLIST_FILE: YES
               INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
               INFOPLIST_KEY_UILaunchScreen_Generation: YES
@@ -72,7 +168,7 @@ jobs:
                    -derivedDataPath build \
                    CODE_SIGN_IDENTITY="" \
                    CODE_SIGNING_REQUIRED=NO \
-                   CODE_SIGNING_ALLOWED=NO \
+                   CODE_SIGNING_ALLOWED: NO
                    clean build
         
         mkdir -p Payload
