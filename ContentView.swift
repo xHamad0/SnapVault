@@ -101,7 +101,6 @@ struct StoryMediaViewer: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // عرض الفيديو أو الصورة مباشرة من ذاكرة التطبيق
             if currentItem.isVideo {
                 CustomVideoPlayerView(
                     url: currentItem.url,
@@ -145,7 +144,6 @@ struct StoryMediaViewer: View {
                 }
             }
 
-            // شريط التقدم العلوي وأزرار التحكم
             VStack(spacing: 8) {
                 if storyModeEnabled && items.count > 1 {
                     HStack(spacing: 4) {
@@ -203,7 +201,6 @@ struct StoryMediaViewer: View {
 
                 Spacer()
 
-                // أزرار التنقل بين المقاطع (السابق / التالي)
                 if items.count > 1 {
                     HStack {
                         Button(action: goToPreviousItem) {
@@ -362,10 +359,9 @@ struct VideoThumbnailView: View {
 
 // MARK: - الواجهة الرئيسية للتطبيق
 struct ContentView: View {
-    // التبويب الحالي (0: التحميل، 1: المحفوظات، 2: الإعدادات)
     @State private var selectedTab: Int = 0
 
-    // إعدادات الميزات القابلة للتشغيل والإيقاف (تُحفظ تلقائياً)
+    // إعدادات الميزات
     @AppStorage("setting_deduplication") private var enableDeduplication: Bool = true
     @AppStorage("setting_storyMode") private var enableStoryMode: Bool = true
     @AppStorage("setting_enableMerger") private var enableVideoMerger: Bool = true
@@ -374,7 +370,6 @@ struct ContentView: View {
     @AppStorage("setting_autoCleanup") private var enableAutoCleanup: Bool = false
     @AppStorage("setting_cleanupDays") private var cleanupDays: Int = 30
 
-    // إعدادات عامة إضافية
     @AppStorage("setting_startMuted") private var startVideosMuted: Bool = false
     @AppStorage("setting_haptics") private var enableHaptics: Bool = true
     @AppStorage("setting_maxStoriesPerUser") private var maxStoriesPerUser: Int = 20
@@ -393,11 +388,13 @@ struct ContentView: View {
     @State private var savedItems: [SavedMediaItem] = []
     @State private var selectedAccountFilter: String = "الكل"
 
-    // متغيرات مشغل ملء الشاشة
+    // تأكيد حذف الحساب
+    @State private var accountPendingDeletion: SnapAccount? = nil
+    @State private var showDeleteAccountAlert: Bool = false
+
+    // مشغل العرض وبصمة الوجه
     @State private var showFullScreenViewer: Bool = false
     @State private var selectedViewerIndex: Int = 0
-
-    // متغيرات القفل بالبصمة
     @State private var isUnlocked: Bool = false
 
     var body: some View {
@@ -445,9 +442,19 @@ struct ContentView: View {
                 imageStoryDuration: imageStoryDuration
             )
         }
+        .alert("تأكيد الحذف", isPresented: $showDeleteAccountAlert, presenting: accountPendingDeletion) { account in
+            Button("نعم، احذف", role: .destructive) {
+                confirmDeleteAccount(account)
+            }
+            Button("إلغاء", role: .cancel) {
+                accountPendingDeletion = nil
+            }
+        } message: { account in
+            Text("هل أنت متأكد من حذف الحساب @\(account.username)؟")
+        }
     }
 
-    // MARK: - شاشة القفل (FaceID)
+    // MARK: - شاشة قفل البصمة
     var lockScreenOverlay: some View {
         VStack(spacing: 20) {
             Spacer()
@@ -481,7 +488,7 @@ struct ContentView: View {
         .onAppear { authenticateUser() }
     }
 
-    // MARK: - 1. تبويب الحسابات والتحميل
+    // MARK: - 1. تبويب التحميل مع ميزة الترتيب وتأكيد الحذف
     var downloaderTabView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -500,13 +507,21 @@ struct ContentView: View {
                             .cornerRadius(12)
                     }
                 }
-                .padding(.top, 10)
+                .padding(.top, 25) // مسافة كافية لمنع التداخل مع الساعة
 
-                // إدارة الحسابات
+                // إدارة الحسابات مع الترتيب والتأكيد
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("إدارة الحسابات (\(accounts.count) حساب)")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
+                    HStack {
+                        Text("إدارة الحسابات (\(accounts.count) حساب)")
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+                        Spacer()
+                        if accounts.count > 1 {
+                            Text("استخدم الأسهم لإعادة الترتيب")
+                                .font(.system(size: 11))
+                                .foregroundColor(.yellow.opacity(0.8))
+                        }
+                    }
 
                     VStack(spacing: 0) {
                         HStack {
@@ -531,10 +546,29 @@ struct ContentView: View {
                                 .foregroundColor(.gray)
                                 .padding()
                         } else {
-                            ForEach($accounts) { $account in
-                                HStack {
+                            ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                                HStack(spacing: 12) {
+                                    // أزرار الترتيب للأعلى والأسفل
+                                    VStack(spacing: 4) {
+                                        Button(action: { moveAccountUp(index: index) }) {
+                                            Image(systemName: "chevron.up")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(index > 0 ? .white : .gray.opacity(0.3))
+                                        }
+                                        .disabled(index == 0)
+
+                                        Button(action: { moveAccountDown(index: index) }) {
+                                            Image(systemName: "chevron.down")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(index < accounts.count - 1 ? .white : .gray.opacity(0.3))
+                                        }
+                                        .disabled(index >= accounts.count - 1)
+                                    }
+                                    .frame(width: 22)
+
+                                    // خانة التحديد
                                     Button(action: {
-                                        account.isSelected.toggle()
+                                        accounts[index].isSelected.toggle()
                                         triggerHaptic()
                                         saveAccounts()
                                     }) {
@@ -548,13 +582,24 @@ struct ContentView: View {
 
                                     Spacer()
 
-                                    Button(action: { deleteAccount(account) }) {
+                                    // زر الحذف مع التأكيد لمنع الحذف بالخطأ
+                                    Button(action: {
+                                        triggerHaptic()
+                                        accountPendingDeletion = account
+                                        showDeleteAccountAlert = true
+                                    }) {
                                         Image(systemName: "trash")
+                                            .font(.system(size: 16))
                                             .foregroundColor(.red.opacity(0.8))
+                                            .padding(6)
                                     }
                                 }
                                 .padding(.horizontal)
-                                .padding(.vertical, 10)
+                                .padding(.vertical, 8)
+
+                                if index < accounts.count - 1 {
+                                    Divider().background(Color.gray.opacity(0.15))
+                                }
                             }
                         }
                     }
@@ -623,7 +668,7 @@ struct ContentView: View {
                     .cornerRadius(16)
                 }
 
-                // زر التحميل اليدوي
+                // زر التحميل بالترتيب
                 Button(action: startSequentialDownload) {
                     HStack {
                         Image(systemName: "arrow.down.doc.fill")
@@ -716,9 +761,9 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal)
-            .padding(.top, 10)
+            .padding(.top, 25)
 
-            // شريط فلترة الحسابات + زر دمج المقاطع
+            // شريط فلترة الحسابات
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(["الكل"] + Array(Set(savedItems.map { $0.username })).sorted(), id: \.self) { user in
@@ -736,7 +781,7 @@ struct ContentView: View {
                 .padding(.horizontal)
             }
 
-            // زر دمج الفيديوهات في مقطع واحد
+            // زر الدمج
             if enableVideoMerger && filteredSavedItems.filter({ $0.isVideo }).count >= 2 {
                 Button(action: mergeFilteredVideos) {
                     HStack {
@@ -817,7 +862,6 @@ struct ContentView: View {
                                     showFullScreenViewer = true
                                 }
 
-                                // اسم الملف (اسم الحساب + التاريخ)
                                 Text(item.filename)
                                     .font(.caption2.bold())
                                     .foregroundColor(.white)
@@ -840,16 +884,15 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 3. تبويب الإعدادات الشاملة والعامة
+    // MARK: - 3. تبويب الإعدادات
     var settingsTabView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("الإعدادات والتحكم")
                     .font(.largeTitle.bold())
                     .foregroundColor(.white)
-                    .padding(.top, 10)
+                    .padding(.top, 25)
 
-                // قسم تشغيل وإيقاف الميزات الذكية
                 VStack(alignment: .leading, spacing: 10) {
                     Text("التحكم بالميزات المضافة")
                         .font(.subheadline)
@@ -897,7 +940,6 @@ struct ContentView: View {
                     .cornerRadius(16)
                 }
 
-                // قسم الحماية والخصوصية (FaceID)
                 VStack(alignment: .leading, spacing: 10) {
                     Text("الأمان والخصوصية")
                         .font(.subheadline)
@@ -919,7 +961,6 @@ struct ContentView: View {
                     .cornerRadius(16)
                 }
 
-                // قسم إعدادات المشغل والعرض العام
                 VStack(alignment: .leading, spacing: 10) {
                     Text("إعدادات المشغل والعرض العامة")
                         .font(.subheadline)
@@ -967,7 +1008,6 @@ struct ContentView: View {
                     .cornerRadius(16)
                 }
 
-                // قسم إدارة المساحة والتنظيف التلقائي
                 VStack(alignment: .leading, spacing: 10) {
                     Text("إدارة المساحة والتنظيف التلقائي")
                         .font(.subheadline)
@@ -1041,7 +1081,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - شريط التبويبات السفلي (3 تبويبات)
+    // MARK: - شريط التبويبات السفلي
     var customBottomBar: some View {
         HStack(spacing: 0) {
             Button(action: {
@@ -1102,7 +1142,28 @@ struct ContentView: View {
         return savedItems.filter { $0.username == selectedAccountFilter }
     }
 
-    // MARK: - الدوال البرمجية للميزات المضافة
+    // MARK: - دوال ترتيب الحسابات وتأكيد الحذف
+    func moveAccountUp(index: Int) {
+        guard index > 0 else { return }
+        accounts.swapAt(index, index - 1)
+        triggerHaptic()
+        saveAccounts()
+    }
+
+    func moveAccountDown(index: Int) {
+        guard index < accounts.count - 1 else { return }
+        accounts.swapAt(index, index + 1)
+        triggerHaptic()
+        saveAccounts()
+    }
+
+    func confirmDeleteAccount(_ account: SnapAccount) {
+        accounts.removeAll { $0.id == account.id }
+        accountPendingDeletion = nil
+        triggerHaptic()
+        saveAccounts()
+        addLog("تم حذف الحساب: @\(account.username)")
+    }
 
     func triggerHaptic() {
         guard enableHaptics else { return }
@@ -1136,11 +1197,6 @@ struct ContentView: View {
         newUsername = ""
     }
 
-    func deleteAccount(_ account: SnapAccount) {
-        accounts.removeAll { $0.id == account.id }
-        saveAccounts()
-    }
-
     func saveAccounts() {
         if let data = try? JSONEncoder().encode(accounts) {
             UserDefaults.standard.set(data, forKey: "snapvault_accounts")
@@ -1172,7 +1228,6 @@ struct ContentView: View {
         return vault
     }
 
-    // توليد اسم الملف: username_YYYY-MM-DD_HH-mm-ss_index
     func generateFileName(for username: String, isVideo: Bool, index: Int) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -1182,7 +1237,6 @@ struct ContentView: View {
         return "\(username)_\(dateStr)_\(index).\(ext)"
     }
 
-    // إدارة سجل منع التكرار
     func isURLAlreadyDownloaded(_ urlString: String) -> Bool {
         let cleanKey = urlString.components(separatedBy: "?").first ?? urlString
         let history = UserDefaults.standard.stringArray(forKey: "snapvault_downloaded_urls") ?? []
@@ -1209,7 +1263,7 @@ struct ContentView: View {
         guard !selected.isEmpty else { return }
         isDownloading = true
         triggerHaptic()
-        addLog("بدء التحميل المتسلسل لـ \(selected.count) حساب...")
+        addLog("بدء التحميل المتسلسل لـ \(selected.count) حساب بالترتيب...")
 
         Task {
             for account in selected {
@@ -1224,25 +1278,56 @@ struct ContentView: View {
         }
     }
 
+    // محرك السحب الشامل والمدعوم
     func fetchAndSavePublicStories(for username: String) async {
-        guard let profileURL = URL(string: "https://www.snapchat.com/add/\(username)") else { return }
+        guard let profileURL = URL(string: "https://www.snapchat.com/@\(username)") else { return }
         var request = URLRequest(url: profileURL)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("ar,en-US;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
-            guard let html = String(data: data, encoding: .utf8) else { return }
+            guard var html = String(data: data, encoding: .utf8) else { return }
 
-            let pattern = #"https://[^\s"<>]+?(?:sc-cdn\.net|snapchat\.com)[^\s"<>]+?"#
-            let regex = try NSRegularExpression(pattern: pattern, options: [])
-            let matches = regex.matches(in: html, options: [], range: NSRange(html.startIndex..., in: html))
+            html = html.replacingOccurrences(of: "\\u002F", with: "/")
+                       .replacingOccurrences(of: "\\/", with: "/")
+                       .replacingOccurrences(of: "&amp;", with: "&")
 
             var mediaURLs: [String] = []
-            for match in matches {
-                if let range = Range(match.range, in: html) {
-                    let urlStr = String(html[range])
-                    if (urlStr.contains(".mp4") || urlStr.contains(".jpg") || urlStr.contains("story")) && !mediaURLs.contains(urlStr) {
-                        mediaURLs.append(urlStr)
+
+            if let startRange = html.range(of: "<script id=\"__NEXT_DATA__\" type=\"application/json\">"),
+               let endRange = html.range(of: "</script>", range: startRange.upperBound..<html.endIndex) {
+                let jsonString = String(html[startRange.upperBound..<endRange.lowerBound])
+                let urlPattern = #"https://[^\s"\\<>]+?(?:sc-cdn\.net|snapchat\.com)[^\s"\\<>]+?"#
+                if let regex = try? NSRegularExpression(pattern: urlPattern, options: []) {
+                    let matches = regex.matches(in: jsonString, options: [], range: NSRange(jsonString.startIndex..., in: jsonString))
+                    for match in matches {
+                        if let r = Range(match.range, in: jsonString) {
+                            let urlStr = String(jsonString[r])
+                            if (urlStr.contains("cf-st.sc-cdn.net") || urlStr.contains("bolt") || urlStr.contains("story") || urlStr.contains(".mp4"))
+                                && !urlStr.contains("bitmoji")
+                                && !urlStr.contains("web-calling")
+                                && !urlStr.contains(".svg")
+                                && !urlStr.contains(".png")
+                                && !mediaURLs.contains(urlStr) {
+                                mediaURLs.append(urlStr)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if mediaURLs.isEmpty {
+                let fallbackPattern = #"https://cf-st\.sc-cdn\.net/[^\s"\\<>]+"#
+                if let regex = try? NSRegularExpression(pattern: fallbackPattern, options: []) {
+                    let matches = regex.matches(in: html, options: [], range: NSRange(html.startIndex..., in: html))
+                    for match in matches {
+                        if let r = Range(match.range, in: html) {
+                            let urlStr = String(html[r])
+                            if !urlStr.contains("bitmoji") && !urlStr.contains(".png") && !mediaURLs.contains(urlStr) {
+                                mediaURLs.append(urlStr)
+                            }
+                        }
                     }
                 }
             }
@@ -1252,18 +1337,27 @@ struct ContentView: View {
                 return
             }
 
+            addLog("تم العثور على \(mediaURLs.count) رابط لـ @\(username)، جاري التحميل...")
+
             var counter = 1
             for urlString in mediaURLs.prefix(maxStoriesPerUser) {
                 if enableDeduplication && isURLAlreadyDownloaded(urlString) {
-                    addLog("تخطي مقطع مكرر لـ @\(username)")
+                    addLog("تخطي مقطع محمل مسبقاً لـ @\(username)")
                     continue
                 }
 
                 guard let mediaURL = URL(string: urlString) else { continue }
-                let (mediaData, response) = try await URLSession.shared.data(from: mediaURL)
-                let mimeType = response.mimeType ?? ""
-                let isVideo = mimeType.contains("video") || urlString.contains(".mp4")
+                var mediaReq = URLRequest(url: mediaURL)
+                mediaReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
 
+                guard let (mediaData, response) = try? await URLSession.shared.data(for: mediaReq),
+                      mediaData.count > 10_000 else { continue }
+
+                let mimeType = (response.mimeType ?? "").lowercased()
+                let isVideo = mimeType.contains("video") || urlString.contains(".mp4") || isMP4Data(mediaData)
+                let isImage = mimeType.contains("image") || mimeType.contains("jpeg") || mimeType.contains("jpg") || !isVideo
+
+                if !isVideo && !isImage { continue }
                 if mediaFilter == .videoOnly && !isVideo { continue }
                 if mediaFilter == .imageOnly && isVideo { continue }
 
@@ -1280,7 +1374,15 @@ struct ContentView: View {
         }
     }
 
-    // دالة دمج الفيديوهات في ملف واحد طويل
+    func isMP4Data(_ data: Data) -> Bool {
+        guard data.count > 12 else { return false }
+        let subdata = data.subdata(in: 4..<8)
+        if let str = String(data: subdata, encoding: .ascii), str == "ftyp" {
+            return true
+        }
+        return false
+    }
+
     func mergeFilteredVideos() {
         let videosToMerge = filteredSavedItems.filter { $0.isVideo }.sorted { $0.creationDate < $1.creationDate }
         guard videosToMerge.count >= 2 else { return }
