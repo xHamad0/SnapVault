@@ -35,29 +35,50 @@ jobs:
         EOF
         fi
 
-    - name: Generate Ghost App Icon
+    - name: Generate Ghost App Icon (Exact 1024x1024)
       run: |
         mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
+        cat << 'EOF' > Sources/Assets.xcassets/Contents.json
+        {
+          "info" : {
+            "author" : "xcode",
+            "version" : 1
+          }
+        }
+        EOF
+
         cat << 'EOF' > generate_icon.swift
         import AppKit
 
-        let size = CGSize(width: 1024, height: 1024)
-        let image = NSImage(size: size)
-        image.lockFocus()
+        let width = 1024
+        let height = 1024
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
 
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         guard let ctx = NSGraphicsContext.current?.cgContext else { exit(1) }
 
-        // 1. خلفية صفراء فاقعة (لون السناب)
-        ctx.setFillColor(CGColor(red: 1.0, green: 0.96, blue: 0.0, alpha: 1.0))
-        ctx.fill(CGRect(origin: .zero, size: size))
+        // 1. خلفية صفراء
+        ctx.setFillColor(CGColor(red: 1.0, green: 0.95, blue: 0.0, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
-        // 2. رسم جسم الشبح الأبيض مع حدود سوداء عريضة
+        // 2. رسم جسم الشبح الأبيض
         let path = CGMutablePath()
         path.move(to: CGPoint(x: 260, y: 240))
         path.addLine(to: CGPoint(x: 260, y: 580))
         path.addArc(center: CGPoint(x: 512, y: 580), radius: 252, startAngle: .pi, endAngle: 0, clockwise: true)
         path.addLine(to: CGPoint(x: 764, y: 240))
-        // تموجات الشبح من الأسفل
         path.addQuadCurve(to: CGPoint(x: 638, y: 240), control: CGPoint(x: 701, y: 150))
         path.addQuadCurve(to: CGPoint(x: 512, y: 240), control: CGPoint(x: 575, y: 310))
         path.addQuadCurve(to: CGPoint(x: 386, y: 240), control: CGPoint(x: 449, y: 150))
@@ -82,12 +103,11 @@ jobs:
         ctx.fillEllipse(in: CGRect(x: 395, y: 570, width: 58, height: 82))
         ctx.fillEllipse(in: CGRect(x: 571, y: 570, width: 58, height: 82))
 
-        // لمعة العيون
         ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         ctx.fillEllipse(in: CGRect(x: 408, y: 615, width: 20, height: 20))
         ctx.fillEllipse(in: CGRect(x: 584, y: 615, width: 20, height: 20))
 
-        // 4. سهم التحميل الأسود وسط الشبح (يميز تطبيق SnapVault)
+        // 4. سهم التحميل الأسود وسط الشبح
         let arrow = CGMutablePath()
         arrow.move(to: CGPoint(x: 482, y: 490))
         arrow.addLine(to: CGPoint(x: 542, y: 490))
@@ -102,11 +122,9 @@ jobs:
         ctx.setFillColor(CGColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1))
         ctx.fillPath()
 
-        image.unlockFocus()
+        NSGraphicsContext.restoreGraphicsState()
 
-        if let tiff = image.tiffRepresentation,
-           let bitmap = NSBitmapImageRep(data: tiff),
-           let png = bitmap.representation(using: .png, properties: [:]) {
+        if let png = rep.representation(using: .png, properties: [:]) {
             try! png.write(to: URL(fileURLWithPath: "Sources/Assets.xcassets/AppIcon.appiconset/icon.png"))
         }
         EOF
@@ -168,7 +186,7 @@ jobs:
                    -derivedDataPath build \
                    CODE_SIGN_IDENTITY="" \
                    CODE_SIGNING_REQUIRED=NO \
-                   CODE_SIGNING_ALLOWED: NO
+                   CODE_SIGNING_ALLOWED=NO \
                    clean build
         
         mkdir -p Payload
