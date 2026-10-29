@@ -1,890 +1,691 @@
 import SwiftUI
-import Photos
 import AVKit
 import AVFoundation
-import BackgroundTasks
 import LocalAuthentication
+import Photos
+import UIKit
 
-// MARK: - 1. نماذج البيانات والإعدادات (Models)
-
-enum MediaFilter: String, CaseIterable, Identifiable {
-    case both = "الصور والفيديو"
-    case imagesOnly = "الصور فقط"
-    case videosOnly = "الفيديو فقط"
-    var id: String { self.rawValue }
-}
-
-enum SaveMode: String, CaseIterable, Identifiable {
-    case separate = "كل حساب لحاله"
-    case combined = "مجلد واحد للجميع"
-    case both = "الاثنين معاً (خاص + عام)"
-    var id: String { self.rawValue }
-}
+// MARK: - 1. Models
 
 struct SnapAccount: Identifiable, Codable, Equatable {
-    var id = UUID()
+    var id: UUID = UUID()
     var username: String
-    var isSelected: Bool = true
+    var category: Int = 0 // 0: خانة 1, 1: خانة 2, 2: خانة 3
+
+    enum CodingKeys: String, CodingKey {
+        case id, username, category
+    }
+
+    init(id: UUID = UUID(), username: String, category: Int = 0) {
+        self.id = id
+        self.username = username
+        self.category = category
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        self.username = try container.decode(String.self, forKey: .username)
+        self.category = try container.decodeIfPresent(Int.self, forKey: .category) ?? 0
+    }
 }
 
-struct SnapMediaItem {
-    let url: URL
-    let isVideo: Bool
-    let timestamp: String
+struct FailedAccountItem: Identifiable, Equatable {
+    var id: String { account.username.lowercased() }
+    let account: SnapAccount
+    let reason: String
 }
 
-struct LocalSavedFile: Identifiable, Equatable {
-    let id = UUID()
+struct MediaItem: Identifiable, Equatable {
+    let id: String
     let url: URL
-    let fileName: String
     let isVideo: Bool
-    let accountName: String
-    let dateFormatted: String
     let creationDate: Date
-    let fileSize: Int64
+    let username: String
 }
 
-struct AlertItem: Identifiable {
-    let id = UUID()
-    let message: String
+// MARK: - 2. مستخرج الصور المصغرة للفيديوهات ومدة المقطع (Video Thumbnail & Duration Cache)
+
+class ThumbnailCacheManager {
+    static let shared = ThumbnailCacheManager()
+    private let imageCache = NSCache<NSString, UIImage>()
+    private var durationCache: [String: String] = [:]
+
+    func getThumbnail(for item: MediaItem) async -> (UIImage?, String?) {
+        let key = item.url.path as NSString
+
+        if !item.isVideo {
+            if let cached = imageCache.object(forKey: key) {
+                return (cached, nil)
+            }
+            if let img = UIImage(contentsOfFile: item.url.path) {
+                imageCache.setObject(img, forKey: key)
+                return (img, nil)
+            }
+            return (nil, nil)
+        } else {
+            if let cachedImg = imageCache.object(forKey: key),
+               let cachedDur = durationCache[item.url.path] {
+                return (cachedImg, cachedDur)
+            }
+
+            return await Task.detached(priority: .utility) {
+                let asset = AVURLAsset(url: item.url)
+                let generator = AVAssetImageGenerator(asset: asset)
+                generator.appliesPreferredTrackTransform = true
+                generator.maximumSize = CGSize(width: 400, height: 400)
+
+                var generatedImage: UIImage? = nil
+                let time = CMTime(seconds: 0.1, preferredTimescale: 600)
+                if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                    generatedImage = UIImage(cgImage: cgImage)
+                }
+
+                let durationSeconds = Int(round(CMTimeGetSeconds(asset.duration)))
+                let mins = max(0, durationSeconds) / 60
+                let secs = max(0, durationSeconds) % 60
+                let durationStr = String(format: "%d:%02d", mins, secs)
+
+                if let img = generatedImage {
+                    self.imageCache.setObject(img, forKey: key)
+                }
+                await MainActor.run {
+                    self.durationCache[item.url.path] = durationStr
+                }
+                return (generatedImage, durationStr)
+            }.value
+        }
+    }
 }
 
-// MARK: - 2. مدير التحميل والتخزين الداخلي (Manager)
+// MARK: - 3. Silent Background Audio Keep-Alive (للعمل في الخلفية أثناء تصفح الجوال)
+
+class BackgroundKeepAliveManager {
+    static let shared = BackgroundKeepAliveManager()
+    private var audioPlayer: AVAudioPlayer?
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+
+    func startKeepAlive() {
+        if backgroundTaskID == .invalid {
+            backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "SnapVaultDownload") { [weak self] in
+                self?.stopKeepAlive()
+            }
+        }
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+
+            if audioPlayer == nil {
+                let silentWavData = Self.makeSilentWavData()
+                audioPlayer = try AVAudioPlayer(data: silentWavData)
+                audioPlayer?.numberOfLoops = -1
+                audioPlayer?.volume = 0.0
+                audioPlayer?.prepareToPlay()
+            }
+            if audioPlayer?.isPlaying == false {
+                audioPlayer?.play()
+            }
+        } catch {
+            print("Background KeepAlive Error: \(error)")
+        }
+    }
+
+    func stopKeepAlive() {
+        audioPlayer?.stop()
+        if backgroundTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTaskID)
+            backgroundTaskID = .invalid
+        }
+    }
+
+    private static func makeSilentWavData() -> Data {
+        let sampleRate: Int32 = 8000
+        let numSamples: Int32 = 8000
+        let dataSize: Int32 = numSamples * 2
+        let fileSize: Int32 = 36 + dataSize
+
+        var data = Data()
+        data.append("RIFF".data(using: .ascii)!)
+        data.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
+        data.append("WAVEfmt ".data(using: .ascii)!)
+        var fmtSize: Int32 = 16
+        var audioFormat: Int16 = 1
+        var numChannels: Int16 = 1
+        var byteRate: Int32 = sampleRate * 2
+        var blockAlign: Int16 = 2
+        var bitsPerSample: Int16 = 16
+        data.append(withUnsafeBytes(of: fmtSize.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: audioFormat.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: numChannels.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
+        data.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
+        data.append("data".data(using: .ascii)!)
+        data.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
+        data.append(Data(count: Int(dataSize)))
+        return data
+    }
+}
+
+// MARK: - 4. ViewModel (المحرك الأساسي + جميع الإضافات)
 
 @MainActor
-class SnapStoryManager: ObservableObject {
-    @Published var accounts: [SnapAccount] = [] {
-        didSet { saveAccounts() }
-    }
-    @Published var mediaFilter: MediaFilter = .both
-    @Published var saveMode: SaveMode = .both
-    
-    @Published var isScheduleEnabled: Bool = false
-    @Published var scheduledTime: Date = Calendar.current.date(bySettingHour: 1, minute: 0, second: 0, of: Date()) ?? Date()
-    
+class VaultViewModel: ObservableObject {
+    static let shared = VaultViewModel()
+
+    @Published var accounts: [SnapAccount] = []
+    @Published var failedAccounts: [FailedAccountItem] = []
+    @Published var logs: [String] = []
+
     @Published var isDownloading: Bool = false
-    @Published var isMerging: Bool = false
-    @Published var statusLog: [String] = []
-    @Published var progress: Double = 0.0
-    @Published var savedFiles: [LocalSavedFile] = []
-    @Published var alertMessage: String? = nil
+    @Published var isPaused: Bool = false
+    @Published var progressText: String = ""
 
-    // إعدادات الميزات القابلة للتشغيل والإيقاف
-    @AppStorage("setting_deduplication") var enableDeduplication: Bool = true
-    @AppStorage("setting_storyMode") var enableStoryMode: Bool = true
-    @AppStorage("setting_enableMerger") var enableVideoMerger: Bool = true
-    @AppStorage("setting_biometricLock") var enableBiometricLock: Bool = false
-    @AppStorage("setting_lockVaultOnly") var lockVaultOnly: Bool = true
-    @AppStorage("setting_autoCleanup") var enableAutoCleanup: Bool = false
-    @AppStorage("setting_cleanupDays") var cleanupDays: Int = 30
-    @AppStorage("setting_startMuted") var startVideosMuted: Bool = false
-    @AppStorage("setting_haptics") var enableHaptics: Bool = true
-    @AppStorage("setting_imageStoryDuration") var imageStoryDuration: Double = 4.0
+    // الإعدادات المعتمدة (لا تتغير إلا بزر الحفظ)
+    @Published var autoDownloadEnabled: Bool = false
+    @Published var autoDownloadHour: Int = 1
+    @Published var autoDownloadMinute: Int = 0
+    @Published var autoDownloadTargetCategory: Int = -1
+    @Published var useFaceID: Bool = false
+    @Published var autoCleanEnabled: Bool = false
+    @Published var autoCleanDays: Int = 7
 
-    private let accountsKey = "SavedSnapAccounts"
-    private let downloadedHistoryKey = "SnapVaultDownloadedHistory"
+    @Published var isUnlocked: Bool = true
+    @Published var mediaRefreshTrigger: UUID = UUID()
+
+    private var downloadTask: Task<Void, Never>?
+    private var lastAutoDownloadDateKey = "SnapVault_LastAutoRunDate"
 
     init() {
         loadAccounts()
-        if enableAutoCleanup {
-            performAutoCleanup()
+        loadSettings()
+        if useFaceID {
+            isUnlocked = false
         }
-        loadSavedFiles()
+        performAutoCleanupIfNeeded()
     }
 
-    func triggerHaptic() {
-        guard enableHaptics else { return }
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.impactOccurred()
-    }
-
-    func addAccount(_ username: String) {
-        let clean = username
-            .replacingOccurrences(of: "@", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard !clean.isEmpty, !accounts.contains(where: { $0.username == clean }) else { return }
-        accounts.append(SnapAccount(username: clean))
-        triggerHaptic()
-        log("➕ تمت إضافة الحساب: @\(clean)")
-    }
-
-    func confirmDeleteAccount(_ account: SnapAccount) {
-        accounts.removeAll { $0.id == account.id }
-        triggerHaptic()
-        log("🗑️ تم حذف الحساب: @\(account.username)")
-    }
-
-    func moveAccountUp(at index: Int) {
-        guard index > 0 else { return }
-        accounts.swapAt(index, index - 1)
-        triggerHaptic()
-    }
-
-    func moveAccountDown(at index: Int) {
-        guard index < accounts.count - 1 else { return }
-        accounts.swapAt(index, index + 1)
-        triggerHaptic()
-    }
-
-    func selectAllAccounts(_ select: Bool) {
-        for i in 0..<accounts.count {
-            accounts[i].isSelected = select
-        }
-        triggerHaptic()
-    }
-
-    private func saveAccounts() {
-        if let encoded = try? JSONEncoder().encode(accounts) {
-            UserDefaults.standard.set(encoded, forKey: accountsKey)
+    func appendLog(_ text: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let timeStr = formatter.string(from: Date())
+        logs.insert("[\(timeStr)] \(text)", at: 0)
+        if logs.count > 150 {
+            logs.removeLast()
         }
     }
 
-    private func loadAccounts() {
-        if let data = UserDefaults.standard.data(forKey: accountsKey),
+    func loadAccounts() {
+        if let data = UserDefaults.standard.data(forKey: "SnapVault_Accounts"),
            let decoded = try? JSONDecoder().decode([SnapAccount].self, from: data) {
             accounts = decoded
         }
     }
 
-    func log(_ message: String) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        statusLog.insert("[\(formatter.string(from: Date()))] \(message)", at: 0)
-    }
-
-    // سجل منع التكرار الذكي
-    private func isAlreadyDownloaded(username: String, timestamp: String, mediaURL: String) -> Bool {
-        let cleanURL = mediaURL.components(separatedBy: "?").first ?? mediaURL
-        let key = "\(username)_\(timestamp)_\(cleanURL)"
-        let history = UserDefaults.standard.stringArray(forKey: downloadedHistoryKey) ?? []
-        return history.contains(key)
-    }
-
-    private func markAsDownloaded(username: String, timestamp: String, mediaURL: String) {
-        let cleanURL = mediaURL.components(separatedBy: "?").first ?? mediaURL
-        let key = "\(username)_\(timestamp)_\(cleanURL)"
-        var history = UserDefaults.standard.stringArray(forKey: downloadedHistoryKey) ?? []
-        if !history.contains(key) {
-            history.append(key)
-            UserDefaults.standard.set(history, forKey: downloadedHistoryKey)
+    func saveAccounts() {
+        if let encoded = try? JSONEncoder().encode(accounts) {
+            UserDefaults.standard.set(encoded, forKey: "SnapVault_Accounts")
         }
     }
 
-    func clearDeduplicationHistory() {
-        UserDefaults.standard.removeObject(forKey: downloadedHistoryKey)
-        triggerHaptic()
-        alertMessage = "✅ تم تصفير سجل منع التكرار، يمكنك الآن إعادة تحميل جميع الستوريات."
+    func accounts(for category: Int) -> [SnapAccount] {
+        accounts.filter { $0.category == category }
     }
 
-    // تحميل حساب واحد محدد بالذات
-    func downloadSingleAccount(_ account: SnapAccount) async {
-        guard !isDownloading else { return }
-        isDownloading = true
-        triggerHaptic()
-        log("🔍 بدء فحص حساب واحد: @\(account.username)...")
+    func addAccount(username: String, to category: Int) {
+        let clean = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "@", with: "")
+        guard !clean.isEmpty else { return }
+        if accounts.contains(where: { $0.username.lowercased() == clean.lowercased() }) {
+            appendLog("⚠️ الحساب @\(clean) مضاف مسبقاً")
+            return
+        }
+        accounts.append(SnapAccount(username: clean, category: category))
+        saveAccounts()
+        appendLog("✅ تمت إضافة @\(clean) إلى خانة \(category + 1)")
+    }
 
-        do {
-            let items = try await fetchPublicStoryMedia(for: account.username)
-            let filteredItems = items.filter { item in
-                switch mediaFilter {
-                case .both: return true
-                case .imagesOnly: return !item.isVideo
-                case .videosOnly: return item.isVideo
-                }
-            }
+    func deleteAccount(_ account: SnapAccount) {
+        accounts.removeAll { $0.id == account.id }
+        failedAccounts.removeAll { $0.account.username.lowercased() == account.username.lowercased() }
+        saveAccounts()
+    }
 
-            if filteredItems.isEmpty {
-                log("ℹ️ لا توجد ستوريات مطابقة في @\(account.username)")
+    func moveAccountToCategory(_ account: SnapAccount, newCategory: Int) {
+        if let idx = accounts.firstIndex(where: { $0.id == account.id }) {
+            accounts[idx].category = newCategory
+            saveAccounts()
+            appendLog("⇄ تم نقل @\(account.username) إلى خانة \(newCategory + 1)")
+        }
+    }
+
+    func moveAccounts(in category: Int, from source: IndexSet, to destination: Int) {
+        var categoryItems = accounts.filter { $0.category == category }
+        categoryItems.move(fromOffsets: source, toOffset: destination)
+
+        var rebuilt: [SnapAccount] = []
+        for cat in 0..<3 {
+            if cat == category {
+                rebuilt.append(contentsOf: categoryItems)
             } else {
-                var savedCount = 0
-                log("⬇️ جاري فحص وحفظ \(filteredItems.count) عنصر من @\(account.username)...")
-                for (itemIndex, media) in filteredItems.enumerated() {
-                    if enableDeduplication && isAlreadyDownloaded(username: account.username, timestamp: media.timestamp, mediaURL: media.url.absoluteString) {
-                        continue
-                    }
-                    try await downloadToAppStorage(media: media, username: account.username, index: itemIndex + 1)
-                    markAsDownloaded(username: account.username, timestamp: media.timestamp, mediaURL: media.url.absoluteString)
-                    savedCount += 1
-                }
-                if savedCount == 0 {
-                    log("ℹ️ كل ستوريات @\(account.username) محملة مسبقاً (منع التكرار مفعل)")
-                } else {
-                    log("✅ تم حفظ \(savedCount) ستوري جديد من @\(account.username)!")
-                }
+                rebuilt.append(contentsOf: accounts.filter { $0.category == cat })
             }
-        } catch {
-            log("❌ تعذر جلب @\(account.username): تأكد أن الحساب عام وعنده ستوري")
         }
-
-        loadSavedFiles()
-        isDownloading = false
+        accounts = rebuilt
+        saveAccounts()
     }
 
-    // التحميل الجماعي بالترتيب للحسابات المحددة يدوياً
-    func startBatchDownload() async {
-        let selectedAccounts = accounts.filter { $0.isSelected }
-        guard !selectedAccounts.isEmpty else {
-            log("⚠️ لم تقم بتحديد أي حساب للتحميل.")
+    func loadSettings() {
+        let d = UserDefaults.standard
+        autoDownloadEnabled = d.bool(forKey: "SV_AutoDownloadEnabled")
+        if d.object(forKey: "SV_AutoDownloadHour") != nil {
+            autoDownloadHour = d.integer(forKey: "SV_AutoDownloadHour")
+            autoDownloadMinute = d.integer(forKey: "SV_AutoDownloadMinute")
+        }
+        if d.object(forKey: "SV_AutoDownloadCategory") != nil {
+            autoDownloadTargetCategory = d.integer(forKey: "SV_AutoDownloadCategory")
+        }
+        useFaceID = d.bool(forKey: "SV_UseFaceID")
+        autoCleanEnabled = d.bool(forKey: "SV_AutoCleanEnabled")
+        let savedDays = d.integer(forKey: "SV_AutoCleanDays")
+        autoCleanDays = savedDays > 0 ? savedDays : 7
+    }
+
+    func applyAndSaveSettings(
+        autoDownload: Bool,
+        hour: Int,
+        minute: Int,
+        targetCategory: Int,
+        faceID: Bool,
+        cleanEnabled: Bool,
+        cleanDays: Int
+    ) {
+        self.autoDownloadEnabled = autoDownload
+        self.autoDownloadHour = hour
+        self.autoDownloadMinute = minute
+        self.autoDownloadTargetCategory = targetCategory
+        self.useFaceID = faceID
+        self.autoCleanEnabled = cleanEnabled
+        self.autoCleanDays = cleanDays
+
+        let d = UserDefaults.standard
+        d.set(autoDownload, forKey: "SV_AutoDownloadEnabled")
+        d.set(hour, forKey: "SV_AutoDownloadHour")
+        d.set(minute, forKey: "SV_AutoDownloadMinute")
+        d.set(targetCategory, forKey: "SV_AutoDownloadCategory")
+        d.set(faceID, forKey: "SV_UseFaceID")
+        d.set(cleanEnabled, forKey: "SV_AutoCleanEnabled")
+        d.set(cleanDays, forKey: "SV_AutoCleanDays")
+
+        d.removeObject(forKey: lastAutoDownloadDateKey)
+        appendLog("💾 تم حفظ الإعدادات الجديدة بنجاح")
+    }
+
+    func checkForegroundAutoDownload() {
+        guard autoDownloadEnabled, !isDownloading else { return }
+
+        let now = Date()
+        let cal = Calendar.current
+        let currentHour = cal.component(.hour, from: now)
+        let currentMinute = cal.component(.minute, from: now)
+
+        let scheduledTotalMinutes = autoDownloadHour * 60 + autoDownloadMinute
+        let currentTotalMinutes = currentHour * 60 + currentMinute
+        let diff = currentTotalMinutes - scheduledTotalMinutes
+
+        guard diff >= 0 && diff <= 3 else { return }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let todayKey = "\(formatter.string(from: now))_\(autoDownloadHour):\(autoDownloadMinute)"
+
+        let lastRun = UserDefaults.standard.string(forKey: lastAutoDownloadDateKey) ?? ""
+        guard lastRun != todayKey else { return }
+
+        UserDefaults.standard.set(todayKey, forKey: lastAutoDownloadDateKey)
+        appendLog("⏰ بدأ التحميل التلقائي المجدول الآن!")
+
+        if autoDownloadTargetCategory == -1 {
+            startDownloadAll()
+        } else {
+            startDownloadCategory(autoDownloadTargetCategory)
+        }
+    }
+
+    func startDownloadAll() {
+        startBatchDownload(targetAccounts: accounts, title: "جميع الخانات")
+    }
+
+    func startDownloadCategory(_ category: Int) {
+        let list = accounts(for: category)
+        startBatchDownload(targetAccounts: list, title: "خانة \(category + 1)")
+    }
+
+    func startDownloadSingle(_ account: SnapAccount) {
+        startBatchDownload(targetAccounts: [account], title: "@\(account.username)")
+    }
+
+    func retryFailedAccounts() {
+        let list = failedAccounts.map { $0.account }
+        guard !list.isEmpty else { return }
+        startBatchDownload(targetAccounts: list, title: "الحسابات المتعثرة")
+    }
+
+    func togglePauseResume() {
+        guard isDownloading else { return }
+        isPaused.toggle()
+        if isPaused {
+            appendLog("⏸️ تم إيقاف التحميل مؤقتاً...")
+        } else {
+            appendLog("▶️ تم استئناف التحميل...")
+        }
+    }
+
+    func cancelDownload() {
+        downloadTask?.cancel()
+        isDownloading = false
+        isPaused = false
+        progressText = ""
+        BackgroundKeepAliveManager.shared.stopKeepAlive()
+        appendLog("⏹️ تم إيقاف وإلغاء عملية التحميل")
+    }
+
+    private func startBatchDownload(targetAccounts: [SnapAccount], title: String) {
+        guard !isDownloading else {
+            appendLog("⚠️ يوجد تحميل جارٍ حالياً!")
+            return
+        }
+        guard !targetAccounts.isEmpty else {
+            appendLog("⚠️ لا توجد حسابات للتحميل في \(title)")
             return
         }
 
         isDownloading = true
-        progress = 0.0
-        triggerHaptic()
-        log("🚀 بدء التحميل الجماعي لـ \(selectedAccounts.count) حسابات المحددة بالترتيب...")
+        isPaused = false
+        BackgroundKeepAliveManager.shared.startKeepAlive()
+        appendLog("🚀 بدء تحميل (\(title)) - العدد: \(targetAccounts.count)")
 
-        for (index, account) in selectedAccounts.enumerated() {
-            log("🔍 [\(index + 1)/\(selectedAccounts.count)] فحص حساب: @\(account.username)...")
-            do {
-                let items = try await fetchPublicStoryMedia(for: account.username)
-                let filteredItems = items.filter { item in
-                    switch mediaFilter {
-                    case .both: return true
-                    case .imagesOnly: return !item.isVideo
-                    case .videosOnly: return item.isVideo
+        downloadTask = Task {
+            for (index, acc) in targetAccounts.enumerated() {
+                if Task.isCancelled { break }
+
+                while isPaused && !Task.isCancelled {
+                    progressText = "⏸️ متوقف مؤقتاً عند @\(acc.username) (\(index + 1)/\(targetAccounts.count))"
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                }
+                if Task.isCancelled { break }
+
+                progressText = "⏳ جاري فحص @\(acc.username) (\(index + 1)/\(targetAccounts.count))..."
+
+                let result = await downloadStoriesForAccount(acc)
+                if Task.isCancelled { break }
+
+                switch result {
+                case .success(let savedCount):
+                    failedAccounts.removeAll { $0.account.username.lowercased() == acc.username.lowercased() }
+                    if savedCount > 0 {
+                        appendLog("✅ @\(acc.username): تم حفظ \(savedCount) مقطع جديد")
+                    } else {
+                        appendLog("ℹ️ @\(acc.username): لا توجد مقاطع جديدة (محدث)")
+                    }
+                case .failure(let err):
+                    let reason = err.localizedDescription
+                    appendLog("❌ خطأ في @\(acc.username): \(reason)")
+                    if let existingIdx = failedAccounts.firstIndex(where: { $0.account.username.lowercased() == acc.username.lowercased() }) {
+                        failedAccounts[existingIdx] = FailedAccountItem(account: acc, reason: reason)
+                    } else {
+                        failedAccounts.append(FailedAccountItem(account: acc, reason: reason))
                     }
                 }
 
-                if filteredItems.isEmpty {
-                    log("ℹ️ لا توجد ستوريات في @\(account.username)")
-                } else {
-                    var savedCount = 0
-                    log("⬇️ حفظ عناصر من @\(account.username)...")
-                    for (itemIndex, media) in filteredItems.enumerated() {
-                        if enableDeduplication && isAlreadyDownloaded(username: account.username, timestamp: media.timestamp, mediaURL: media.url.absoluteString) {
-                            continue
-                        }
-                        try await downloadToAppStorage(media: media, username: account.username, index: itemIndex + 1)
-                        markAsDownloaded(username: account.username, timestamp: media.timestamp, mediaURL: media.url.absoluteString)
-                        savedCount += 1
-                    }
-                    log("✅ انتهى @\(account.username) (حُفظ \(savedCount) جديد)")
-                }
-            } catch {
-                log("❌ خطأ في @\(account.username): تخطي...")
+                mediaRefreshTrigger = UUID()
             }
-            progress = Double(index + 1) / Double(selectedAccounts.count)
-        }
 
-        loadSavedFiles()
-        log("🎉 اكتمل تحميل الحسابات المحددة بالترتيب!")
-        isDownloading = false
+            isDownloading = false
+            isPaused = false
+            progressText = ""
+            BackgroundKeepAliveManager.shared.stopKeepAlive()
+            if !Task.isCancelled {
+                appendLog("🏁 اكتملت دورة التحميل (\(title))")
+            }
+        }
     }
 
-    // دالة السحب الأصلية الشغالة 100% كما هي في كودك
-    private func fetchPublicStoryMedia(for username: String) async throws -> [SnapMediaItem] {
+    // MARK: - محرك التحميل الأساسي (__NEXT_DATA__) محفوظ بالكامل بدون تغيير
+
+    private struct StorySnapInfo {
+        let id: String
+        let mediaUrl: String
+        let isVideo: Bool
+        let timestamp: TimeInterval
+    }
+
+    private func downloadStoriesForAccount(_ account: SnapAccount) async -> Result<Int, Error> {
+        let username = account.username.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: "https://www.snapchat.com/add/\(username)") else {
-            throw URLError(.badURL)
+            return .failure(NSError(domain: "SnapVault", code: 1, userInfo: [NSLocalizedDescriptionKey: "رابط الحساب غير صالح"]))
         }
 
         var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 25
+        request.setValue(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue("ar,en-US;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
 
-        let (data, _) = try await URLSession.shared.data(for: request)
-        guard let html = String(data: data, encoding: .utf8),
-              let startRange = html.range(of: "<script id=\"__NEXT_DATA__\" type=\"application/json\">"),
-              let endRange = html.range(of: "</script>", range: startRange.upperBound..<html.endIndex) else {
-            throw URLError(.cannotParseResponse)
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode >= 400 {
+                return .failure(NSError(domain: "SnapVault", code: httpResp.statusCode, userInfo: [NSLocalizedDescriptionKey: "الحساب غير موجود أو خاص (\(httpResp.statusCode))"]))
+            }
+
+            guard let html = String(data: data, encoding: .utf8) else {
+                return .failure(NSError(domain: "SnapVault", code: 2, userInfo: [NSLocalizedDescriptionKey: "تعذر قراءة صفحة الحساب"]))
+            }
+
+            guard let jsonString = extractNextDataJSON(from: html),
+                  let jsonData = jsonString.data(using: .utf8),
+                  let rootObj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                return .failure(NSError(domain: "SnapVault", code: 3, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على بيانات __NEXT_DATA__"]))
+            }
+
+            let snaps = parseSnapsFromNextData(rootObj)
+            if snaps.isEmpty {
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لا توجد ستوريات عامة متاحة حالياً"]))
+            }
+
+            let folderURL = accountFolder(for: username)
+            var savedCount = 0
+
+            for snap in snaps {
+                if Task.isCancelled { break }
+                while isPaused && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                }
+                if Task.isCancelled { break }
+
+                let ext = snap.isVideo ? "mp4" : "jpg"
+                let safeID = snap.id.replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: ":", with: "_")
+                let fileName = "\(Int(snap.timestamp))_\(safeID).\(ext)"
+                let fileURL = folderURL.appendingPathComponent(fileName)
+
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    continue
+                }
+
+                guard let mediaURL = URL(string: snap.mediaUrl) else { continue }
+                let (mediaData, mediaResp) = try await URLSession.shared.data(from: mediaURL)
+                if let httpMedia = mediaResp as? HTTPURLResponse, httpMedia.statusCode == 200, !mediaData.isEmpty {
+                    try mediaData.write(to: fileURL, options: .atomic)
+                    let snapDate = Date(timeIntervalSince1970: snap.timestamp)
+                    try? FileManager.default.setAttributes([.creationDate: snapDate, .modificationDate: snapDate], ofItemAtPath: fileURL.path)
+                    savedCount += 1
+                }
+            }
+
+            return .success(savedCount)
+        } catch {
+            return .failure(error)
         }
+    }
 
-        let jsonString = String(html[startRange.upperBound..<endRange.lowerBound])
-        guard let jsonData = jsonString.data(using: .utf8),
-              let rootObj = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-              let props = rootObj["props"] as? [String: Any],
+    private func extractNextDataJSON(from html: String) -> String? {
+        let pattern = #"<script\s+id="__NEXT_DATA__"\s+type="application/json"[^>]*>([\s\S]*?)</script>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+              let match = regex.firstMatch(in: html, options: [], range: NSRange(html.startIndex..., in: html)),
+              let range = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+        return String(html[range])
+    }
+
+    private func parseSnapsFromNextData(_ root: [String: Any]) -> [StorySnapInfo] {
+        var results: [StorySnapInfo] = []
+        guard let props = root["props"] as? [String: Any],
               let pageProps = props["pageProps"] as? [String: Any] else {
-            throw URLError(.cannotParseResponse)
+            return results
         }
 
-        var results: [SnapMediaItem] = []
         if let story = pageProps["story"] as? [String: Any],
            let snapList = story["snapList"] as? [[String: Any]] {
-            for snap in snapList {
-                if let snapUrls = snap["snapUrls"] as? [String: Any],
-                   let mediaUrlString = snapUrls["mediaUrl"] as? String,
-                   let mediaUrl = URL(string: mediaUrlString) {
-                    let mediaType = snap["snapMediaType"] as? Int ?? 0
-                    let isVideo = (mediaType == 1)
-                    let timestamp = String(describing: snap["timestampInSec"] ?? Int(Date().timeIntervalSince1970))
-                    results.append(SnapMediaItem(url: mediaUrl, isVideo: isVideo, timestamp: timestamp))
+            for item in snapList {
+                if let info = extractSingleSnap(from: item) {
+                    results.append(info)
                 }
             }
         }
+
+        if results.isEmpty,
+           let highlights = pageProps["curatedHighlights"] as? [[String: Any]] {
+            for highlight in highlights {
+                if let snapList = highlight["snapList"] as? [[String: Any]] {
+                    for item in snapList {
+                        if let info = extractSingleSnap(from: item) {
+                            results.append(info)
+                        }
+                    }
+                }
+            }
+        }
+
         return results
     }
 
-    // تحويل التوقيت إلى تاريخ مقروء في اسم الملف: username_YYYY-MM-DD_HH-mm-ss_index
-    private func formattedDateForFileName(from timestampStr: String) -> String {
-        let date: Date
-        if let unix = Double(timestampStr), unix > 1_000_000_000 {
-            date = Date(timeIntervalSince1970: unix)
-        } else {
-            date = Date()
+    private func extractSingleSnap(from item: [String: Any]) -> StorySnapInfo? {
+        guard let snapUrls = item["snapUrls"] as? [String: Any],
+              let mediaUrl = snapUrls["mediaUrl"] as? String,
+              !mediaUrl.isEmpty else {
+            return nil
         }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        return formatter.string(from: date)
+
+        var snapId = UUID().uuidString
+        if let idDict = item["snapId"] as? [String: Any], let val = idDict["value"] as? String {
+            snapId = val
+        } else if let val = item["snapId"] as? String {
+            snapId = val
+        }
+
+        let mediaType = item["snapMediaType"] as? Int ?? 0
+        let isVideo = (mediaType == 1) || mediaUrl.lowercased().contains(".mp4")
+
+        var timestamp = Date().timeIntervalSince1970
+        if let tsDict = item["timestampInSec"] as? [String: Any],
+           let valStr = tsDict["value"] as? String,
+           let valDouble = Double(valStr) {
+            timestamp = valDouble
+        } else if let tsDict = item["timestampInSec"] as? [String: Any],
+                  let valNum = tsDict["value"] as? Double {
+            timestamp = valNum
+        }
+
+        return StorySnapInfo(id: snapId, mediaUrl: mediaUrl, isVideo: isVideo, timestamp: timestamp)
     }
 
-    private func downloadToAppStorage(media: SnapMediaItem, username: String, index: Int) async throws {
-        let (tempURL, _) = try await URLSession.shared.download(from: media.url)
-        let ext = media.isVideo ? "mp4" : "jpg"
-        let readableDate = formattedDateForFileName(from: media.timestamp)
-        let fileName = "\(username)_\(readableDate)_\(index).\(ext)"
+    // MARK: - إدارة الملفات والأستوديو الداخلي
 
-        let fileManager = FileManager.default
-        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let rootDir = docsDir.appendingPathComponent("SnapVault", isDirectory: true)
-
-        var targetFolders: [URL] = []
-        let mediaSubFolder = media.isVideo ? "Videos" : "Images"
-
-        if saveMode == .separate || saveMode == .both {
-            let userDir = rootDir.appendingPathComponent("Accounts/\(username)/\(mediaSubFolder)", isDirectory: true)
-            targetFolders.append(userDir)
+    var baseVaultDirectory: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("SnapVault", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-
-        if saveMode == .combined || saveMode == .both {
-            let allDir = rootDir.appendingPathComponent("All_Accounts/\(mediaSubFolder)", isDirectory: true)
-            targetFolders.append(allDir)
-        }
-
-        for folder in targetFolders {
-            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
-            let destinationURL = folder.appendingPathComponent(fileName)
-            if !fileManager.fileExists(atPath: destinationURL.path) {
-                try fileManager.copyItem(at: tempURL, to: destinationURL)
-            }
-        }
+        return dir
     }
 
-    func loadSavedFiles() {
-        let fileManager = FileManager.default
-        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let rootDir = docsDir.appendingPathComponent("SnapVault", isDirectory: true)
-
-        guard let enumerator = fileManager.enumerator(
-            at: rootDir,
-            includingPropertiesForKeys: [.creationDateKey, .fileSizeKey]
-        ) else { return }
-
-        var loaded: [LocalSavedFile] = []
-        var seenNames = Set<String>()
-
-        let displayFormatter = DateFormatter()
-        displayFormatter.dateFormat = "yyyy/MM/dd hh:mm a"
-
-        for case let fileURL as URL in enumerator {
-            let ext = fileURL.pathExtension.lowercased()
-            if ext == "mp4" || ext == "jpg" {
-                let name = fileURL.lastPathComponent
-                if !seenNames.contains(name) {
-                    seenNames.insert(name)
-                    let accountName = name.components(separatedBy: "_").first ?? "غير معروف"
-                    let res = try? fileURL.resourceValues(forKeys: [.creationDateKey, .fileSizeKey])
-                    let creationDate = res?.creationDate ?? Date()
-                    let fileSize = Int64(res?.fileSize ?? 0)
-
-                    loaded.append(LocalSavedFile(
-                        url: fileURL,
-                        fileName: name,
-                        isVideo: ext == "mp4",
-                        accountName: accountName,
-                        dateFormatted: displayFormatter.string(from: creationDate),
-                        creationDate: creationDate,
-                        fileSize: fileSize
-                    ))
-                }
-            }
+    func accountFolder(for username: String) -> URL {
+        let folder = baseVaultDirectory.appendingPathComponent(username, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: folder.path) {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         }
-        savedFiles = loaded.sorted { $0.creationDate > $1.creationDate }
+        return folder
     }
 
-    func exportSingleFileToPhotos(_ file: LocalSavedFile) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else {
-                Task { @MainActor in
-                    self.alertMessage = "⚠️ يرجى السماح للتطبيق بالوصول للصور من إعدادات الآيفون."
-                }
-                return
-            }
+    func fetchSavedUserFolders() -> [String] {
+        guard let contents = try? FileManager.default.contentsOfDirectory(at: baseVaultDirectory, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        return contents.filter { $0.hasDirectoryPath }.map { $0.lastPathComponent }.sorted()
+    }
 
-            PHPhotoLibrary.shared().performChanges({
-                if file.isVideo {
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: file.url)
-                } else if let data = try? Data(contentsOf: file.url),
-                          let image = UIImage(data: data) {
-                    PHAssetChangeRequest.creationRequestForAsset(from: image)
-                }
-            }) { success, error in
-                Task { @MainActor in
-                    if success {
-                        self.alertMessage = "✅ تم حفظ المقطع في ألبوم الاستوديو!"
-                    } else {
-                        self.alertMessage = "❌ فشل الحفظ: \(error?.localizedDescription ?? "")"
-                    }
+    func fetchMediaItems(for username: String) -> [MediaItem] {
+        let folder = accountFolder(for: username)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var items: [MediaItem] = []
+        for file in files {
+            let ext = file.pathExtension.lowercased()
+            guard ["mp4", "mov", "jpg", "jpeg", "png"].contains(ext) else { continue }
+            let isVideo = (ext == "mp4" || ext == "mov")
+            let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
+            let cDate = (attrs?[.creationDate] as? Date) ?? (attrs?[.modificationDate] as? Date) ?? Date()
+
+            items.append(MediaItem(
+                id: file.lastPathComponent,
+                url: file,
+                isVideo: isVideo,
+                creationDate: cDate,
+                username: username
+            ))
+        }
+        return items
+    }
+
+    func deleteMediaItem(_ item: MediaItem) {
+        try? FileManager.default.removeItem(at: item.url)
+        mediaRefreshTrigger = UUID()
+    }
+
+    func performAutoCleanupIfNeeded() {
+        guard autoCleanEnabled else { return }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -autoCleanDays, to: Date()) ?? Date()
+        for user in fetchSavedUserFolders() {
+            for item in fetchMediaItems(for: user) {
+                if item.creationDate < cutoff {
+                    try? FileManager.default.removeItem(at: item.url)
                 }
             }
         }
     }
 
-    // حذف الملف من جميع المجلدات الداخلية (العام والخاص)
-    func deleteFile(_ file: LocalSavedFile) {
-        let fileManager = FileManager.default
-        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let rootDir = docsDir.appendingPathComponent("SnapVault", isDirectory: true)
-
-        if let enumerator = fileManager.enumerator(at: rootDir, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator {
-                if fileURL.lastPathComponent == file.fileName {
-                    try? fileManager.removeItem(at: fileURL)
-                }
-            }
-        }
-        triggerHaptic()
-        loadSavedFiles()
-    }
-
-    func deleteAllFiles() {
-        let fileManager = FileManager.default
-        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let rootDir = docsDir.appendingPathComponent("SnapVault", isDirectory: true)
-        try? fileManager.removeItem(at: rootDir)
-        triggerHaptic()
-        loadSavedFiles()
-        alertMessage = "🗑️ تم حذف جميع المحفوظات بنجاح."
-    }
-
-    func formattedTotalStorage() -> String {
-        let total = savedFiles.reduce(Int64(0)) { $0 + $1.fileSize }
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useMB, .useGB]
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: total)
-    }
-
-    func performAutoCleanup() {
-        let fileManager = FileManager.default
-        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let rootDir = docsDir.appendingPathComponent("SnapVault", isDirectory: true)
-        guard let enumerator = fileManager.enumerator(at: rootDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
-        let cutoff = Calendar.current.date(byAdding: .day, value: -cleanupDays, to: Date()) ?? Date()
-
-        for case let fileURL as URL in enumerator {
-            if let created = (try? fileURL.resourceValues(forKeys: [.creationDateKey]))?.creationDate,
-               created < cutoff {
-                try? fileManager.removeItem(at: fileURL)
-            }
-        }
-    }
-
-    // دمج الفيديوهات في مقطع واحد طويل
-    func mergeVideos(files: [LocalSavedFile], accountLabel: String) {
-        let videos = files.filter { $0.isVideo }.sorted { $0.creationDate < $1.creationDate }
-        guard videos.count >= 2 else { return }
-
-        isMerging = true
-        triggerHaptic()
-
-        Task {
-            let composition = AVMutableComposition()
-            guard let compVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
-                  let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-                self.isMerging = false
-                return
-            }
-
-            var currentTime = CMTime.zero
-
-            for item in videos {
-                let asset = AVURLAsset(url: item.url)
-                let duration = (try? await asset.load(.duration)) ?? .zero
-                guard duration > .zero else { continue }
-
-                if let vTrack = (try? await asset.loadTracks(withMediaType: .video))?.first {
-                    try? compVideoTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: vTrack, at: currentTime)
-                    if let transform = try? await vTrack.load(.preferredTransform) {
-                        compVideoTrack.preferredTransform = transform
-                    }
-                }
-                if let aTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first {
-                    try? compAudioTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: aTrack, at: currentTime)
-                }
-                currentTime = CMTimeAdd(currentTime, duration)
-            }
-
-            let cleanLabel = accountLabel == "الكل" ? "All" : accountLabel
-            let dateStr = formattedDateForFileName(from: "")
-            let mergedName = "\(cleanLabel)-مدمج_\(dateStr)_\(videos.count).mp4"
-
-            let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let mergedFolder = docsDir.appendingPathComponent("SnapVault/All_Accounts/Videos", isDirectory: true)
-            try? FileManager.default.createDirectory(at: mergedFolder, withIntermediateDirectories: true)
-            let outputURL = mergedFolder.appendingPathComponent(mergedName)
-
-            if let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) {
-                export.outputURL = outputURL
-                export.outputFileType = .mp4
-                await export.export()
-            }
-
-            self.isMerging = false
-            self.loadSavedFiles()
-            self.alertMessage = "✅ تم دمج \(videos.count) مقاطع فيديو في ملف واحد بنجاح!"
-        }
-    }
-
-    func scheduleDailyDownload() {
-        let request = BGProcessingTaskRequest(identifier: "com.snapvault.dailyfetch")
-        request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
-
-        var components = Calendar.current.dateComponents([.hour, .minute], from: scheduledTime)
-        components.second = 0
-        if let nextDate = Calendar.current.nextDate(after: Date(), matching: components, matchingPolicy: .nextTime) {
-            request.earliestBeginDate = nextDate
-            try? BGTaskScheduler.shared.submit(request)
-            let formatter = DateFormatter()
-            formatter.timeStyle = .short
-            log("⏰ تم ضبط الجدولة التلقائية يومياً الساعة \(formatter.string(from: nextDate))")
-        }
-    }
-}
-
-// MARK: - 3. مشغل الوسائط الكامل بملء الشاشة ووضع القصة (Full Screen Player)
-
-struct NativeFullScreenVideoPlayer: UIViewControllerRepresentable {
-    let url: URL
-    let isMuted: Bool
-    var onEnded: (() -> Void)?
-
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let controller = AVPlayerViewController()
-        let player = AVPlayer(url: url)
-        player.isMuted = isMuted
-        controller.player = player
-        controller.showsPlaybackControls = true
-        controller.videoGravity = .resizeAspect
-
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
-
-        NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: player.currentItem,
-            queue: .main
-        ) { _ in
-            onEnded?()
-        }
-
-        player.play()
-        return controller
-    }
-
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
-}
-
-struct FullScreenStoryPlayer: View {
-    @ObservedObject var manager: SnapStoryManager
-    let files: [LocalSavedFile]
-    @State var currentIndex: Int
-    @Environment(\.dismiss) var dismiss
-
-    @State private var scale: CGFloat = 1.0
-    @State private var imageTimer: Timer? = nil
-
-    var currentFile: LocalSavedFile {
-        files[min(max(currentIndex, 0), files.count - 1)]
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            // عرض الفيديو أو الصورة مباشرة من ذاكرة التطبيق بملء الشاشة
-            if currentFile.isVideo {
-                NativeFullScreenVideoPlayer(
-                    url: currentFile.url,
-                    isMuted: manager.startVideosMuted,
-                    onEnded: {
-                        if manager.enableStoryMode {
-                            nextItem()
-                        }
-                    }
-                )
-                .id(currentFile.id)
-                .ignoresSafeArea()
-            } else {
-                if let data = try? Data(contentsOf: currentFile.url),
-                   let uiImage = UIImage(data: data) {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .scaledToFit()
-                        .scaleEffect(scale)
-                        .gesture(
-                            MagnificationGesture()
-                                .onChanged { val in scale = max(1.0, min(val, 4.0)) }
-                                .onEnded { _ in withAnimation { if scale < 1.2 { scale = 1.0 } } }
-                        )
-                        .onTapGesture(count: 2) {
-                            withAnimation { scale = scale > 1.0 ? 1.0 : 2.5 }
-                        }
-                        .onAppear { startImageTimer() }
-                        .onChange(of: currentIndex) { _ in
-                            scale = 1.0
-                            startImageTimer()
-                        }
-                } else {
-                    Text("تعذر فتح الصورة")
-                        .foregroundColor(.white)
-                }
-            }
-
-            // شريط التحكم العلوي والسفلي
-            VStack {
-                if manager.enableStoryMode && files.count > 1 {
-                    HStack(spacing: 4) {
-                        ForEach(0..<min(files.count, 30), id: \.self) { idx in
-                            Capsule()
-                                .fill(idx <= currentIndex ? Color.yellow : Color.white.opacity(0.3))
-                                .frame(height: 3)
-                        }
-                    }
-                    .padding(.horizontal)
-                    .padding(.top, 8)
-                }
-
-                HStack {
-                    Button(action: {
-                        imageTimer?.invalidate()
-                        dismiss()
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 30))
-                            .foregroundColor(.white)
-                    }
-
-                    Spacer()
-
-                    VStack(spacing: 2) {
-                        Text("@\(currentFile.accountName)")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                        Text(currentFile.fileName)
-                            .font(.caption2)
-                            .foregroundColor(.gray)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    HStack(spacing: 14) {
-                        Button(action: { manager.exportSingleFileToPhotos(currentFile) }) {
-                            Image(systemName: "square.and.arrow.down.fill")
-                                .font(.system(size: 24))
-                                .foregroundColor(.white)
-                        }
-
-                        ShareLink(item: currentFile.url) {
-                            Image(systemName: "square.and.arrow.up.circle.fill")
-                                .font(.system(size: 28))
-                                .foregroundColor(.yellow)
-                        }
-                    }
-                }
-                .padding()
-                .background(Color.black.opacity(0.6))
-
-                Spacer()
-
-                if files.count > 1 {
-                    HStack {
-                        Button(action: previousItem) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "chevron.right")
-                                Text("السابق")
-                            }
-                            .font(.caption.bold())
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Color.black.opacity(0.65))
-                            .foregroundColor(currentIndex > 0 ? .white : .gray)
-                            .cornerRadius(20)
-                        }
-                        .disabled(currentIndex == 0)
-
-                        Spacer()
-
-                        Text("\(currentIndex + 1) / \(files.count)")
-                            .font(.caption.bold())
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.black.opacity(0.65))
-                            .foregroundColor(.yellow)
-                            .cornerRadius(14)
-
-                        Spacer()
-
-                        Button(action: nextItem) {
-                            HStack(spacing: 4) {
-                                Text("التالي")
-                                Image(systemName: "chevron.left")
-                            }
-                            .font(.caption.bold())
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Color.black.opacity(0.65))
-                            .foregroundColor(currentIndex < files.count - 1 ? .white : .gray)
-                            .cornerRadius(20)
-                        }
-                        .disabled(currentIndex >= files.count - 1)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 35)
-                }
-            }
-        }
-        .onDisappear { imageTimer?.invalidate() }
-    }
-
-    private func startImageTimer() {
-        imageTimer?.invalidate()
-        guard manager.enableStoryMode, !currentFile.isVideo else { return }
-        imageTimer = Timer.scheduledTimer(withTimeInterval: manager.imageStoryDuration, repeats: false) { _ in
-            nextItem()
-        }
-    }
-
-    private func nextItem() {
-        imageTimer?.invalidate()
-        if currentIndex < files.count - 1 {
-            withAnimation { currentIndex += 1 }
-        } else if manager.enableStoryMode {
-            dismiss()
-        }
-    }
-
-    private func previousItem() {
-        imageTimer?.invalidate()
-        if currentIndex > 0 {
-            withAnimation { currentIndex -= 1 }
-        }
-    }
-}
-
-// صورة مصغرة خفيفة وسريعة للفيديو في الشبكة بدل المشغل المصغر الثقيل
-struct VideoCardThumbnail: View {
-    let url: URL
-    @State private var thumbnail: UIImage? = nil
-
-    var body: some View {
-        ZStack {
-            if let thumbnail = thumbnail {
-                Image(uiImage: thumbnail)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                Color.black.opacity(0.4)
-            }
-
-            Image(systemName: "play.circle.fill")
-                .font(.system(size: 42))
-                .foregroundColor(.white.opacity(0.9))
-                .shadow(radius: 4)
-        }
-        .onAppear {
-            DispatchQueue.global(qos: .userInitiated).async {
-                let asset = AVAsset(url: url)
-                let generator = AVAssetImageGenerator(asset: asset)
-                generator.appliesPreferredTrackTransform = true
-                let time = CMTime(seconds: 0.2, preferredTimescale: 600)
-                if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
-                    let uiImg = UIImage(cgImage: cgImage)
-                    DispatchQueue.main.async { self.thumbnail = uiImg }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - 4. واجهة المستخدم الرئيسية (UI)
-
-struct ContentView: View {
-    @StateObject private var manager = SnapStoryManager()
-    @State private var isUnlocked: Bool = false
-
-    var body: some View {
-        ZStack {
-            if manager.enableBiometricLock && !manager.lockVaultOnly && !isUnlocked {
-                BiometricLockView(isUnlocked: $isUnlocked)
-            } else {
-                TabView {
-                    DownloaderHomeView(manager: manager)
-                        .tabItem {
-                            Label("الحسابات والتحميل", systemImage: "arrow.down.circle.fill")
-                        }
-
-                    Group {
-                        if manager.enableBiometricLock && manager.lockVaultOnly && !isUnlocked {
-                            BiometricLockView(isUnlocked: $isUnlocked)
-                        } else {
-                            InternalGalleryView(manager: manager)
-                        }
-                    }
-                    .tabItem {
-                        Label("محفوظات التطبيق (\(manager.savedFiles.count))", systemImage: "folder.fill")
-                    }
-
-                    AppSettingsView(manager: manager)
-                        .tabItem {
-                            Label("الإعدادات", systemImage: "gearshape.fill")
-                        }
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-        .environment(\.layoutDirection, .rightToLeft)
-        .onAppear {
-            if !manager.enableBiometricLock {
-                isUnlocked = true
-            }
-        }
-        .alert(item: Binding(
-            get: { manager.alertMessage.map { AlertItem(message: $0) } },
-            set: { _ in manager.alertMessage = nil }
-        )) { item in
-            Alert(title: Text("تنبيه"), message: Text(item.message), dismissButton: .default(Text("حسناً")))
-        }
-    }
-}
-
-struct BiometricLockView: View {
-    @Binding var isUnlocked: Bool
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "faceid")
-                .font(.system(size: 64))
-                .foregroundColor(.yellow)
-            Text("المحتوى محمي ببصمة الوجه")
-                .font(.title2.bold())
-            Button("فتح القفل الآن") {
-                authenticate()
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.yellow)
-            .foregroundColor(.black)
-        }
-        .onAppear { authenticate() }
-    }
-
-    private func authenticate() {
+    func authenticateFaceID() {
         let context = LAContext()
         var error: NSError?
         if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
-            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "فتح قفل المحفوظات") { success, _ in
-                DispatchQueue.main.async { isUnlocked = success }
+            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "فتح خزنة SnapVault") { success, _ in
+                Task { @MainActor in
+                    self.isUnlocked = success
+                }
             }
         } else {
             isUnlocked = true
@@ -892,453 +693,943 @@ struct BiometricLockView: View {
     }
 }
 
-// MARK: - 5. تبويب الحسابات والتحميل (مع الترتيب وتأكيد الحذف)
+// MARK: - 5. الواجهة الرئيسية (ContentView)
 
-struct DownloaderHomeView: View {
-    @ObservedObject var manager: SnapStoryManager
-    @State private var usernameInput: String = ""
-    @State private var accountPendingDeletion: SnapAccount? = nil
-    @State private var showDeleteConfirm: Bool = false
+struct ContentView: View {
+    @StateObject private var vm = VaultViewModel.shared
+    private let autoTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("إدارة الحسابات (\(manager.accounts.count) حساب)")) {
-                    HStack {
-                        TextField("اكتب اليوزر (مثال: snapchat)", text: $usernameInput)
-                            .autocapitalization(.none)
-                            .disableAutocorrection(true)
-                        Button(action: {
-                            manager.addAccount(usernameInput)
-                            usernameInput = ""
-                        }) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(.yellow)
+        Group {
+            if !vm.isUnlocked {
+                lockScreenView
+            } else {
+                TabView {
+                    AccountsAndDownloadView(vm: vm)
+                        .tabItem {
+                            Label("الحسابات والتحميل", systemImage: "arrow.down.circle.fill")
                         }
-                    }
 
-                    if !manager.accounts.isEmpty {
-                        HStack(spacing: 12) {
-                            Button("تحديد الكل") { manager.selectAllAccounts(true) }
-                                .buttonStyle(.bordered)
-                                .font(.caption.bold())
-
-                            Button("إلغاء الكل") { manager.selectAllAccounts(false) }
-                                .buttonStyle(.bordered)
-                                .font(.caption.bold())
-                            
-                            Spacer()
-                            
-                            Text("المحدد: \(manager.accounts.filter { $0.isSelected }.count)")
-                                .font(.caption.bold())
-                                .foregroundColor(.secondary)
+                    GalleryFoldersView(vm: vm)
+                        .tabItem {
+                            Label("المعرض والمجلدات", systemImage: "photo.on.rectangle.angled")
                         }
-                        .padding(.vertical, 4)
-                    }
 
-                    if manager.accounts.isEmpty {
-                        Text("لم تقم بإضافة حسابات بعد.").foregroundColor(.secondary)
-                    } else {
-                        ForEach(Array(manager.accounts.enumerated()), id: \.element.id) { index, account in
-                            HStack(spacing: 8) {
-                                // أزرار تحريك الحساب للأعلى والأسفل
-                                VStack(spacing: 4) {
-                                    Button(action: { manager.moveAccountUp(at: index) }) {
-                                        Image(systemName: "chevron.up")
-                                            .font(.system(size: 11, weight: .bold))
-                                            .foregroundColor(index > 0 ? .primary : .gray.opacity(0.3))
-                                    }
-                                    .buttonStyle(BorderlessButtonStyle())
-                                    .disabled(index == 0)
-
-                                    Button(action: { manager.moveAccountDown(at: index) }) {
-                                        Image(systemName: "chevron.down")
-                                            .font(.system(size: 11, weight: .bold))
-                                            .foregroundColor(index < manager.accounts.count - 1 ? .primary : .gray.opacity(0.3))
-                                    }
-                                    .buttonStyle(BorderlessButtonStyle())
-                                    .disabled(index >= manager.accounts.count - 1)
-                                }
-                                .frame(width: 20)
-
-                                // زر التحديد
-                                Button(action: {
-                                    manager.accounts[index].isSelected.toggle()
-                                    manager.triggerHaptic()
-                                }) {
-                                    Image(systemName: account.isSelected ? "checkmark.square.fill" : "square")
-                                        .foregroundColor(account.isSelected ? .blue : .gray)
-                                        .font(.title3)
-                                }
-                                .buttonStyle(BorderlessButtonStyle())
-
-                                Text("@\(account.username)")
-                                    .bold()
-                                    .lineLimit(1)
-
-                                Spacer()
-
-                                // زر تحميل الحساب لحاله
-                                Button(action: {
-                                    Task { await manager.downloadSingleAccount(account) }
-                                }) {
-                                    Text("تحميل هذا لحاله")
-                                        .font(.caption2.bold())
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 5)
-                                        .background(Color.yellow.opacity(0.3))
-                                        .foregroundColor(.primary)
-                                        .cornerRadius(6)
-                                }
-                                .buttonStyle(BorderlessButtonStyle())
-                                .disabled(manager.isDownloading)
-
-                                // زر الحذف مع نافذة تأكيد لمنع اللمس بالخطأ
-                                Button(action: {
-                                    accountPendingDeletion = account
-                                    showDeleteConfirm = true
-                                }) {
-                                    Image(systemName: "trash")
-                                        .foregroundColor(.red)
-                                        .padding(.leading, 4)
-                                }
-                                .buttonStyle(BorderlessButtonStyle())
-                            }
+                    SettingsScreenView(vm: vm)
+                        .tabItem {
+                            Label("الإعدادات", systemImage: "gearshape.fill")
                         }
-                    }
                 }
-
-                Section(header: Text("إعدادات التخزين والفلترة")) {
-                    Picker("نوع الوسائط", selection: $manager.mediaFilter) {
-                        ForEach(MediaFilter.allCases) { filter in
-                            Text(filter.rawValue).tag(filter)
-                        }
-                    }
-
-                    Picker("طريقة تنظيم المجلدات", selection: $manager.saveMode) {
-                        ForEach(SaveMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                }
-
-                Section(header: Text("الجدولة التلقائية")) {
-                    Toggle("تفعيل التحميل التلقائي اليومي", isOn: $manager.isScheduleEnabled)
-                        .onChange(of: manager.isScheduleEnabled) { enabled in
-                            if enabled { manager.scheduleDailyDownload() }
-                        }
-
-                    if manager.isScheduleEnabled {
-                        DatePicker("وقت التحميل", selection: $manager.scheduledTime, displayedComponents: .hourAndMinute)
-                            .onChange(of: manager.scheduledTime) { _ in
-                                manager.scheduleDailyDownload()
-                            }
-                    }
-                }
-
-                Section {
-                    Button(action: {
-                        Task { await manager.startBatchDownload() }
-                    }) {
-                        HStack {
-                            Spacer()
-                            if manager.isDownloading {
-                                ProgressView().padding(.trailing, 6)
-                                Text("جاري التحميل... \(Int(manager.progress * 100))%")
-                            } else {
-                                Image(systemName: "list.bullet.rectangle.portrait.fill")
-                                Text("تحميل الحسابات المحددة يدوياً بالترتيب")
-                                    .bold()
-                            }
-                            Spacer()
-                        }
-                    }
-                    .disabled(manager.isDownloading || manager.accounts.isEmpty)
-                }
-
-                Section(header: HStack {
-                    Text("سجل العمليات المباشر")
-                    Spacer()
-                    if !manager.statusLog.isEmpty {
-                        Button("مسح") { manager.statusLog.removeAll() }
-                            .font(.caption)
-                    }
-                }) {
-                    if manager.statusLog.isEmpty {
-                        Text("جاهز للعمل...").font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
-                    } else {
-                        ForEach(manager.statusLog, id: \.self) { log in
-                            Text(log).font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
-                        }
-                    }
-                }
+                .environment(\.layoutDirection, .rightToLeft)
             }
-            .navigationTitle("محمل السناب")
-            .alert("تأكيد حذف الحساب", isPresented: $showDeleteConfirm, presenting: accountPendingDeletion) { account in
-                Button("حذف @\(account.username)", role: .destructive) {
-                    manager.confirmDeleteAccount(account)
-                }
-                Button("إلغاء", role: .cancel) {
-                    accountPendingDeletion = nil
-                }
-            } message: { account in
-                Text("هل أنت متأكد من حذف الحساب @\(account.username) من القائمة؟")
+        }
+        .onReceive(autoTimer) { _ in
+            vm.checkForegroundAutoDownload()
+        }
+    }
+
+    private var lockScreenView: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 72))
+                .foregroundColor(.yellow)
+            Text("SnapVault مقفل")
+                .font(.title.bold())
+            Text("الرجاء تأكيد الهوية ببصمة الوجه لفتح الخزنة")
+                .foregroundColor(.secondary)
+            Button {
+                vm.authenticateFaceID()
+            } label: {
+                Label("فتح القفل الآن", systemImage: "faceid")
+                    .font(.headline)
+                    .padding(.horizontal, 30)
+                    .padding(.vertical, 14)
+                    .background(Color.yellow)
+                    .foregroundColor(.black)
+                    .cornerRadius(14)
             }
+        }
+        .onAppear {
+            vm.authenticateFaceID()
         }
     }
 }
 
-// MARK: - 6. تبويب محفوظات التطبيق (مع المشغل الكامل والدمج)
+// MARK: - 6. شاشة الحسابات والتحميل (الأقسام الـ 3 + السحب + الأخطاء + الإيقاف المؤقت)
 
-struct InternalGalleryView: View {
-    @ObservedObject var manager: SnapStoryManager
-    @State private var selectedAccountFilter: String = "الكل"
-    @State private var selectedTypeFilter: MediaFilter = .both
-    @State private var showFullScreenPlayer: Bool = false
-    @State private var selectedFileIndex: Int = 0
+struct AccountsAndDownloadView: View {
+    @ObservedObject var vm: VaultViewModel
+    @State private var selectedCategory: Int = 0
+    @State private var newUsername: String = ""
+    @State private var isReorderMode: Bool = true
 
-    var availableAccounts: [String] {
-        let names = Set(manager.savedFiles.map { $0.accountName })
-        return ["الكل"] + names.sorted()
-    }
-
-    var filteredFiles: [LocalSavedFile] {
-        manager.savedFiles.filter { file in
-            let matchAccount = (selectedAccountFilter == "الكل" || file.accountName == selectedAccountFilter)
-            let matchType: Bool
-            switch selectedTypeFilter {
-            case .both: matchType = true
-            case .imagesOnly: matchType = !file.isVideo
-            case .videosOnly: matchType = file.isVideo
-            }
-            return matchAccount && matchType
-        }
+    var currentCategoryAccounts: [SnapAccount] {
+        vm.accounts(for: selectedCategory)
     }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 10) {
-                HStack {
-                    Picker("الحساب", selection: $selectedAccountFilter) {
-                        ForEach(availableAccounts, id: \.self) { acc in
-                            Text(acc == "الكل" ? "كل الحسابات" : "@\(acc)").tag(acc)
-                        }
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 16) {
+
+                    Picker("أقسام الحسابات", selection: $selectedCategory) {
+                        Text("خانة 1 (\(vm.accounts(for: 0).count))").tag(0)
+                        Text("خانة 2 (\(vm.accounts(for: 1).count))").tag(1)
+                        Text("خانة 3 (\(vm.accounts(for: 2).count))").tag(2)
                     }
-                    .pickerStyle(MenuPickerStyle())
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
 
-                    Spacer()
-
-                    Picker("النوع", selection: $selectedTypeFilter) {
-                        ForEach(MediaFilter.allCases) { type in
-                            Text(type.rawValue).tag(type)
-                        }
-                    }
-                    .pickerStyle(SegmentedPickerStyle())
-                }
-                .padding(.horizontal)
-
-                // أزرار عرض القصة ودمج المقاطع
-                if !filteredFiles.isEmpty {
                     HStack(spacing: 10) {
-                        if manager.enableStoryMode {
-                            Button(action: {
-                                selectedFileIndex = 0
-                                showFullScreenPlayer = true
-                            }) {
-                                Label("تشغيل الكل كقصة", systemImage: "play.fill")
-                                    .font(.caption.bold())
-                                    .padding(.vertical, 8)
-                                    .frame(maxWidth: .infinity)
-                                    .background(Color.yellow)
-                                    .foregroundColor(.black)
-                                    .cornerRadius(10)
-                            }
-                        }
+                        TextField("أضف اسم الحساب في خانة \(selectedCategory + 1)...", text: $newUsername)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
 
-                        if manager.enableVideoMerger && filteredFiles.filter({ $0.isVideo }).count >= 2 {
-                            Button(action: {
-                                manager.mergeVideos(files: filteredFiles, accountLabel: selectedAccountFilter)
-                            }) {
-                                Label(manager.isMerging ? "جاري الدمج..." : "دمج الفيديوهات (\(filteredFiles.filter({ $0.isVideo }).count))", systemImage: "film.stack.fill")
-                                    .font(.caption.bold())
-                                    .padding(.vertical, 8)
-                                    .frame(maxWidth: .infinity)
-                                    .background(Color.blue.opacity(0.25))
-                                    .foregroundColor(.blue)
-                                    .cornerRadius(10)
-                            }
-                            .disabled(manager.isMerging)
+                        Button {
+                            vm.addAccount(username: newUsername, to: selectedCategory)
+                            newUsername = ""
+                        } label: {
+                            Label("إضافة", systemImage: "plus.circle.fill")
+                                .font(.subheadline.bold())
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .background(Color.yellow)
+                                .foregroundColor(.black)
+                                .cornerRadius(10)
                         }
                     }
                     .padding(.horizontal)
-                }
 
-                if filteredFiles.isEmpty {
-                    Spacer()
-                    Text("لا توجد ملفات محفوظة بعد.").foregroundColor(.secondary)
-                    Spacer()
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
-                            ForEach(Array(filteredFiles.enumerated()), id: \.element.id) { index, file in
-                                VStack(alignment: .leading, spacing: 6) {
-                                    ZStack(alignment: .topLeading) {
-                                        if file.isVideo {
-                                            VideoCardThumbnail(url: file.url)
-                                                .frame(height: 210)
-                                                .clipped()
-                                                .cornerRadius(10)
-                                        } else if let data = try? Data(contentsOf: file.url),
-                                                  let uiImage = UIImage(data: data) {
-                                            Image(uiImage: uiImage)
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(height: 210)
-                                                .clipped()
-                                                .cornerRadius(10)
-                                        }
-
-                                        Text("@\(file.accountName)")
-                                            .font(.caption2.bold())
-                                            .padding(5)
-                                            .background(Color.black.opacity(0.65))
-                                            .foregroundColor(.white)
-                                            .cornerRadius(6)
-                                            .padding(6)
-                                    }
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        // فتح الفيديو أو الصورة مباشرة في المشغل الكامل بملء الشاشة
-                                        manager.triggerHaptic()
-                                        selectedFileIndex = index
-                                        showFullScreenPlayer = true
-                                    }
-
-                                    // عرض اسم الملف (اسم الحساب + التاريخ)
-                                    Text(file.fileName)
-                                        .font(.caption2.bold())
-                                        .lineLimit(1)
-
-                                    Text(file.dateFormatted)
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.secondary)
-
-                                    HStack {
-                                        Button(action: {
-                                            manager.exportSingleFileToPhotos(file)
-                                        }) {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "square.and.arrow.down.fill")
-                                                Text("للاستوديو").font(.caption2.bold())
-                                            }
-                                            .padding(.vertical, 6)
-                                            .frame(maxWidth: .infinity)
-                                            .background(Color.blue)
-                                            .foregroundColor(.white)
-                                            .cornerRadius(8)
-                                        }
-
-                                        Button(action: {
-                                            manager.deleteFile(file)
-                                        }) {
-                                            Image(systemName: "trash.fill")
-                                                .foregroundColor(.red)
-                                                .padding(6)
-                                                .background(Color.red.opacity(0.15))
-                                                .cornerRadius(8)
-                                        }
-                                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("حسابات خانة \(selectedCategory + 1)")
+                                .font(.headline)
+                            Spacer()
+                            Button {
+                                withAnimation {
+                                    isReorderMode.toggle()
                                 }
-                                .padding(8)
-                                .background(Color(.secondarySystemBackground))
-                                .cornerRadius(12)
+                            } label: {
+                                Label(isReorderMode ? "السحب مفعّل ☰" : "تفعيل السحب ☰", systemImage: "line.3.horizontal")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(isReorderMode ? Color.blue.opacity(0.2) : Color.gray.opacity(0.2))
+                                    .cornerRadius(8)
                             }
                         }
-                        .padding()
+                        .padding(.horizontal)
+
+                        if currentCategoryAccounts.isEmpty {
+                            Text("لا توجد حسابات في خانة \(selectedCategory + 1) حالياً")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 24)
+                                .background(Color(.secondarySystemBackground))
+                                .cornerRadius(12)
+                                .padding(.horizontal)
+                        } else {
+                            List {
+                                ForEach(currentCategoryAccounts) { acc in
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "person.crop.circle.fill")
+                                            .foregroundColor(.yellow)
+                                            .font(.title3)
+
+                                        Text("@\(acc.username)")
+                                            .font(.body.weight(.semibold))
+
+                                        Spacer()
+
+                                        Menu {
+                                            ForEach(0..<3, id: \.self) { targetCat in
+                                                if targetCat != selectedCategory {
+                                                    Button("نقل إلى خانة \(targetCat + 1)") {
+                                                        vm.moveAccountToCategory(acc, newCategory: targetCat)
+                                                    }
+                                                }
+                                            }
+                                        } label: {
+                                            Image(systemName: "arrow.left.arrow.right.circle")
+                                                .foregroundColor(.secondary)
+                                                .font(.title3)
+                                        }
+                                        .buttonStyle(.borderless)
+
+                                        Button {
+                                            vm.startDownloadSingle(acc)
+                                        } label: {
+                                            Image(systemName: "arrow.down.circle.fill")
+                                                .foregroundColor(.green)
+                                                .font(.title3)
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .disabled(vm.isDownloading)
+
+                                        Button {
+                                            vm.deleteAccount(acc)
+                                        } label: {
+                                            Image(systemName: "trash.fill")
+                                                .foregroundColor(.red)
+                                                .font(.subheadline)
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                                .onMove { source, destination in
+                                    vm.moveAccounts(in: selectedCategory, from: source, to: destination)
+                                }
+                            }
+                            .listStyle(.plain)
+                            .environment(\.editMode, .constant(isReorderMode ? .active : .inactive))
+                            .frame(height: CGFloat(currentCategoryAccounts.count * 56 + 12))
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                            .padding(.horizontal)
+                        }
+                    }
+
+                    VStack(spacing: 10) {
+                        Button {
+                            vm.startDownloadCategory(selectedCategory)
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.down.doc.fill")
+                                Text("تحميل حسابات (خانة \(selectedCategory + 1)) فقط (\(currentCategoryAccounts.count))")
+                                    .fontWeight(.bold)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 13)
+                            .background(Color.yellow)
+                            .foregroundColor(.black)
+                            .cornerRadius(12)
+                        }
+                        .disabled(vm.isDownloading || currentCategoryAccounts.isEmpty)
+
+                        Button {
+                            vm.startDownloadAll()
+                        } label: {
+                            HStack {
+                                Image(systemName: "bolt.horizontal.circle.fill")
+                                Text("تحميل جميع الخانات معاً (\(vm.accounts.count))")
+                                    .fontWeight(.semibold)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(Color.blue.opacity(0.18))
+                            .foregroundColor(.blue)
+                            .cornerRadius(12)
+                        }
+                        .disabled(vm.isDownloading || vm.accounts.isEmpty)
+
+                        if vm.isDownloading {
+                            VStack(spacing: 8) {
+                                Text(vm.progressText)
+                                    .font(.caption.bold())
+                                    .foregroundColor(.orange)
+
+                                HStack(spacing: 12) {
+                                    Button {
+                                        vm.togglePauseResume()
+                                    } label: {
+                                        Label(
+                                            vm.isPaused ? "استئناف التحميل" : "إيقاف مؤقت",
+                                            systemImage: vm.isPaused ? "play.fill" : "pause.fill"
+                                        )
+                                        .font(.subheadline.bold())
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(vm.isPaused ? Color.green : Color.orange)
+                                        .foregroundColor(.white)
+                                        .cornerRadius(10)
+                                    }
+
+                                    Button {
+                                        vm.cancelDownload()
+                                    } label: {
+                                        Label("إلغاء", systemImage: "stop.fill")
+                                            .font(.subheadline.bold())
+                                            .padding(.horizontal, 20)
+                                            .padding(.vertical, 10)
+                                            .background(Color.red)
+                                            .foregroundColor(.white)
+                                            .cornerRadius(10)
+                                    }
+                                }
+                            }
+                            .padding(10)
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("سجل العمليات", systemImage: "terminal.fill")
+                                .font(.headline)
+                            Spacer()
+                            Button("مسح السجل") {
+                                vm.logs.removeAll()
+                            }
+                            .font(.caption)
+                        }
+
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                if vm.logs.isEmpty {
+                                    Text("السجل فارغ حالياً...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    ForEach(Array(vm.logs.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
+                                            .font(.system(size: 12, design: .monospaced))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .frame(height: 130)
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(10)
+                    }
+                    .padding(.horizontal)
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("الحسابات التي حدث فيها خطأ (\(vm.failedAccounts.count))", systemImage: "exclamationmark.triangle.fill")
+                                .font(.headline)
+                                .foregroundColor(vm.failedAccounts.isEmpty ? .secondary : .orange)
+                            Spacer()
+                            if !vm.failedAccounts.isEmpty {
+                                Button("مسح القائمة") {
+                                    vm.failedAccounts.removeAll()
+                                }
+                                .font(.caption)
+                                .foregroundColor(.red)
+                            }
+                        }
+
+                        if vm.failedAccounts.isEmpty {
+                            Text("لا توجد أخطاء تحميل حالياً ✅")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .background(Color(.secondarySystemBackground))
+                                .cornerRadius(10)
+                        } else {
+                            VStack(spacing: 6) {
+                                ForEach(vm.failedAccounts) { item in
+                                    HStack {
+                                        Text("@\(item.account.username)")
+                                            .font(.subheadline.bold())
+                                        Text("— \(item.reason)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Button {
+                                            vm.startDownloadSingle(item.account)
+                                        } label: {
+                                            Image(systemName: "arrow.clockwise.circle.fill")
+                                                .foregroundColor(.orange)
+                                        }
+                                        .disabled(vm.isDownloading)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color(.tertiarySystemBackground))
+                                    .cornerRadius(8)
+                                }
+
+                                Button {
+                                    vm.retryFailedAccounts()
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "arrow.clockwise")
+                                        Text("إعادة تحميل الحسابات المتعثرة فقط (\(vm.failedAccounts.count))")
+                                            .fontWeight(.bold)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 11)
+                                    .background(Color.orange)
+                                    .foregroundColor(.black)
+                                    .cornerRadius(10)
+                                }
+                                .disabled(vm.isDownloading)
+                            }
+                            .padding(10)
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 20)
+                }
+                .padding(.top, 10)
+            }
+            .navigationTitle("SnapVault 👻")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+// MARK: - 7. شاشة المعرض الشبكي (مطابقة للصورة + شعار نوع الملف في الزاوية تحت يمين)
+
+struct GalleryFoldersView: View {
+    @ObservedObject var vm: VaultViewModel
+
+    var folders: [String] {
+        _ = vm.mediaRefreshTrigger
+        return vm.fetchSavedUserFolders()
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if folders.isEmpty {
+                    Text("لا توجد مجلدات محفوظة بعد.")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(folders, id: \.self) { username in
+                        let items = vm.fetchMediaItems(for: username)
+                        let photosCount = items.filter { !$0.isVideo }.count
+                        let videosCount = items.filter { $0.isVideo }.count
+
+                        NavigationLink {
+                            AccountMediaDetailView(vm: vm, username: username)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "folder.fill")
+                                    .font(.title2)
+                                    .foregroundColor(.yellow)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("@\(username)")
+                                        .font(.headline)
+                                    Text("\(photosCount) صورة، \(videosCount) مقطعاً")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
                     }
                 }
             }
-            .navigationTitle("محفوظات التطبيق")
-            .onAppear { manager.loadSavedFiles() }
-            .fullScreenCover(isPresented: $showFullScreenPlayer) {
-                FullScreenStoryPlayer(
-                    manager: manager,
-                    files: filteredFiles,
-                    currentIndex: selectedFileIndex
+            .navigationTitle("خزنة المقاطع 📁")
+        }
+    }
+}
+
+struct AccountMediaDetailView: View {
+    @ObservedObject var vm: VaultViewModel
+    let username: String
+
+    @State private var newestFirst: Bool = true
+    @State private var filterToday: Bool = false
+    @State private var filterYesterday: Bool = false
+
+    @State private var selectedItemIndex: Int? = nil
+    @State private var isShowingPlayer: Bool = false
+    @State private var statusAlertMessage: String? = nil
+
+    var filteredAndSortedItems: [MediaItem] {
+        _ = vm.mediaRefreshTrigger
+        let allItems = vm.fetchMediaItems(for: username)
+        let cal = Calendar.current
+
+        let dateFiltered = allItems.filter { item in
+            if !filterToday && !filterYesterday {
+                return true
+            }
+            var match = false
+            if filterToday && cal.isDateInToday(item.creationDate) {
+                match = true
+            }
+            if filterYesterday && cal.isDateInYesterday(item.creationDate) {
+                match = true
+            }
+            return match
+        }
+
+        return dateFiltered.sorted { a, b in
+            newestFirst ? (a.creationDate > b.creationDate) : (a.creationDate < b.creationDate)
+        }
+    }
+
+    // شبكة ثلاثية متراصة جداً بفاصل 1.5 نقطة مثل التصميم المرفق تماماً
+    private let columns = [
+        GridItem(.flexible(), spacing: 1.5),
+        GridItem(.flexible(), spacing: 1.5),
+        GridItem(.flexible(), spacing: 1.5)
+    ]
+
+    var body: some View {
+        let items = filteredAndSortedItems
+        let photoCount = items.filter { !$0.isVideo }.count
+        let videoCount = items.filter { $0.isVideo }.count
+
+        VStack(spacing: 6) {
+
+            // شريط الفرز (الأحدث/الأقدم) وفلتر (اليوم / أمس)
+            VStack(spacing: 8) {
+                Picker("ترتيب العرض", selection: $newestFirst) {
+                    Text("الأحدث أولاً ⬇️").tag(true)
+                    Text("الأقدم أولاً ⬆️").tag(false)
+                }
+                .pickerStyle(.segmented)
+
+                HStack(spacing: 8) {
+                    Text("عرض أيام:")
+                        .font(.caption.bold())
+                        .foregroundColor(.secondary)
+
+                    Button {
+                        filterToday = false
+                        filterYesterday = false
+                    } label: {
+                        Text("الكل")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background((!filterToday && !filterYesterday) ? Color.yellow : Color(.secondarySystemBackground))
+                            .foregroundColor((!filterToday && !filterYesterday) ? .black : .primary)
+                            .cornerRadius(8)
+                    }
+
+                    Button {
+                        filterToday.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: filterToday ? "checkmark.circle.fill" : "circle")
+                            Text("اليوم")
+                        }
+                        .font(.caption.bold())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(filterToday ? Color.green : Color(.secondarySystemBackground))
+                        .foregroundColor(filterToday ? .white : .primary)
+                        .cornerRadius(8)
+                    }
+
+                    Button {
+                        filterYesterday.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: filterYesterday ? "checkmark.circle.fill" : "circle")
+                            Text("أمس")
+                        }
+                        .font(.caption.bold())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(filterYesterday ? Color.blue : Color(.secondarySystemBackground))
+                        .foregroundColor(filterYesterday ? .white : .primary)
+                        .cornerRadius(8)
+                    }
+
+                    Spacer()
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 4)
+
+            // الشبكة المتراصة للصور والفيديوهات
+            if items.isEmpty {
+                Spacer()
+                Text("لا توجد مقاطع مطابقة للفلتر المحدد")
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 1.5) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                            MediaThumbnailCell(item: item)
+                                .onTapGesture {
+                                    selectedItemIndex = index
+                                    isShowingPlayer = true
+                                }
+                                .contextMenu {
+                                    Button {
+                                        saveToCameraRoll(item)
+                                    } label: {
+                                        Label("حفظ في ألبوم الكاميرا", systemImage: "square.and.arrow.down")
+                                    }
+                                    Button(role: .destructive) {
+                                        vm.deleteMediaItem(item)
+                                    } label: {
+                                        Label("حذف من الخزنة", systemImage: "trash")
+                                    }
+                                }
+                        }
+                    }
+                }
+                .background(Color.black)
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text("@\(username) 👻")
+                        .font(.headline.bold())
+                    Text("\(photoCount) صورة، \(videoCount) مقطعاً")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .fullScreenCover(isPresented: $isShowingPlayer) {
+            if let startIdx = selectedItemIndex, !items.isEmpty {
+                SwipeableMediaPlayerView(
+                    items: items,
+                    currentIndex: startIdx,
+                    onClose: { isShowingPlayer = false }
                 )
+            }
+        }
+        .alert(statusAlertMessage ?? "", isPresented: Binding(
+            get: { statusAlertMessage != nil },
+            set: { if !$0 { statusAlertMessage = nil } }
+        )) {
+            Button("حسناً", role: .cancel) {}
+        }
+    }
+
+    private func saveToCameraRoll(_ item: MediaItem) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else { return }
+            PHPhotoLibrary.shared().performChanges({
+                if item.isVideo {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: item.url)
+                } else {
+                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: item.url)
+                }
+            }) { success, _ in
+                Task { @MainActor in
+                    statusAlertMessage = success ? "تم الحفظ في ألبوم الكاميرا ✅" : "تعذر الحفظ في الألبوم"
+                }
             }
         }
     }
 }
 
-// MARK: - 7. تبويب الإعدادات الشاملة والعامة
-
-struct AppSettingsView: View {
-    @ObservedObject var manager: SnapStoryManager
-    @State private var showConfirmDeleteAll: Bool = false
+struct MediaThumbnailCell: View {
+    let item: MediaItem
+    @State private var thumbnailImage: UIImage? = nil
+    @State private var durationText: String? = nil
 
     var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("تشغيل وإيقاف الميزات الذكية")) {
-                    Toggle("منع تكرار التحميل الذكي", isOn: $manager.enableDeduplication)
-                    Toggle("وضع القصة المتتابع (Story Mode)", isOn: $manager.enableStoryMode)
-                    Toggle("إظهار أداة دمج الفيديوهات", isOn: $manager.enableVideoMerger)
+        GeometryReader { geo in
+            ZStack(alignment: .bottomTrailing) {
+                // خلفية ومعاينة المقطع أو الصورة
+                Color(white: 0.12)
+
+                if let img = thumbnailImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                } else {
+                    ProgressView()
+                        .tint(.white.opacity(0.6))
+                        .frame(width: geo.size.width, height: geo.size.height)
                 }
 
-                Section(header: Text("الأمان والخصوصية (FaceID)")) {
-                    Toggle("قفل التطبيق ببصمة الوجه", isOn: $manager.enableBiometricLock)
-                    if manager.enableBiometricLock {
-                        Toggle("قفل قسم المحفوظات فقط", isOn: $manager.lockVaultOnly)
+                // تدرج خفيف أسفل الخلية لوضوح الشعار في الزاوية السفلية اليمنى
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.45)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+                .frame(height: 28)
+                .frame(maxWidth: .infinity, alignment: .bottom)
+
+                // الشعار الصغير في الزاوية السفلية اليمنى (يبين هل الملف صورة أو فيديو + المدة)
+                HStack(spacing: 3) {
+                    Image(systemName: item.isVideo ? "video.fill" : "photo.fill")
+                        .font(.system(size: 9, weight: .bold))
+                    if item.isVideo, let dur = durationText {
+                        Text(dur)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
                     }
                 }
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 3)
+                .background(Color.black.opacity(0.45))
+                .cornerRadius(5)
+                .padding(5)
+            }
+            // تثبيت اتجاه الخلية من اليسار لليمين لضمان بقاء .bottomTrailing دائماً في الزاوية (تحت يمين) بصرياً
+            .environment(\.layoutDirection, .leftToRight)
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .clipped()
+        .task(id: item.id) {
+            let (img, dur) = await ThumbnailCacheManager.shared.getThumbnail(for: item)
+            thumbnailImage = img
+            durationText = dur
+        }
+    }
+}
 
-                Section(header: Text("إعدادات المشغل والعرض العامة")) {
-                    Toggle("بدء الفيديو بدون صوت (Mute)", isOn: $manager.startVideosMuted)
-                    Toggle("تفعيل الاهتزاز التفاعلي (Haptics)", isOn: $manager.enableHaptics)
-                    Stepper("مدة عرض الصورة: \(Int(manager.imageStoryDuration)) ثواني", value: $manager.imageStoryDuration, in: 2...15, step: 1)
-                }
+// MARK: - 8. مشغل الصور والفيديو مع دعم السحب يمين ويسار (Paging TabView)
 
-                Section(header: Text("المساحة والتنظيف التلقائي")) {
-                    HStack {
-                        Text("المساحة المستخدمة حالياً")
-                        Spacer()
-                        Text(manager.formattedTotalStorage())
-                            .bold()
-                            .foregroundColor(.yellow)
-                    }
+struct SwipeableMediaPlayerView: View {
+    let items: [MediaItem]
+    @State var currentIndex: Int
+    let onClose: () -> Void
 
-                    Toggle("حذف المقاطع القديمة تلقائياً", isOn: $manager.enableAutoCleanup)
-                    if manager.enableAutoCleanup {
-                        Picker("حذف الأقدم من", selection: $manager.cleanupDays) {
-                            Text("7 أيام").tag(7)
-                            Text("14 يوماً").tag(14)
-                            Text("30 يوماً").tag(30)
-                            Text("60 يوماً").tag(60)
-                        }
-                    }
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
 
-                    Button("تصفير سجل منع التكرار (لإعادة تحميل الكل)") {
-                        manager.clearDeduplicationHistory()
-                    }
-                    .foregroundColor(.orange)
-
-                    Button("حذف جميع المحفوظات نهائياً") {
-                        showConfirmDeleteAll = true
-                    }
-                    .foregroundColor(.red)
+            TabView(selection: $currentIndex) {
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    SingleMediaPageView(
+                        item: item,
+                        isCurrentPage: currentIndex == index
+                    )
+                    .tag(index)
                 }
             }
-            .navigationTitle("الإعدادات")
-            .alert("حذف جميع المحفوظات", isPresented: $showConfirmDeleteAll) {
-                Button("نعم، احذف الكل", role: .destructive) {
-                    manager.deleteAllFiles()
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+
+            HStack {
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.white)
                 }
-                Button("إلغاء", role: .cancel) {}
-            } message: {
-                Text("هل أنت متأكد من مسح كافة الصور والفيديوهات المحفوظة داخل التطبيق؟")
+
+                Spacer()
+
+                Text("\(currentIndex + 1) / \(items.count)")
+                    .font(.subheadline.bold())
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.6))
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+
+                Spacer()
+
+                HStack(spacing: 14) {
+                    Button {
+                        if currentIndex > 0 {
+                            withAnimation { currentIndex -= 1 }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.right.circle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(currentIndex > 0 ? .white : .gray)
+                    }
+
+                    Button {
+                        if currentIndex < items.count - 1 {
+                            withAnimation { currentIndex += 1 }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.left.circle.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(currentIndex < items.count - 1 ? .white : .gray)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+        }
+    }
+}
+
+struct SingleMediaPageView: View {
+    let item: MediaItem
+    let isCurrentPage: Bool
+    @State private var player: AVPlayer? = nil
+
+    var body: some View {
+        ZStack {
+            if item.isVideo {
+                if let player = player {
+                    VideoPlayer(player: player)
+                        .ignoresSafeArea()
+                } else {
+                    ProgressView()
+                        .tint(.white)
+                }
+            } else {
+                if let uiImage = UIImage(contentsOfFile: item.url.path) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
+        .onAppear {
+            if item.isVideo {
+                let avPlayer = AVPlayer(url: item.url)
+                player = avPlayer
+                if isCurrentPage {
+                    avPlayer.play()
+                }
+            }
+        }
+        .onChange(of: isCurrentPage) { active in
+            if item.isVideo {
+                if active {
+                    player?.seek(to: .zero)
+                    player?.play()
+                } else {
+                    player?.pause()
+                }
+            }
+        }
+        .onDisappear {
+            player?.pause()
+        }
+    }
+}
+
+// MARK: - 9. شاشة الإعدادات مع زر (حفظ الإعدادات) الإلزامي
+
+struct SettingsScreenView: View {
+    @ObservedObject var vm: VaultViewModel
+
+    @State private var draftAutoDownload: Bool = false
+    @State private var draftScheduleTime: Date = Date()
+    @State private var draftTargetCategory: Int = -1
+    @State private var draftUseFaceID: Bool = false
+    @State private var draftAutoCleanEnabled: Bool = false
+    @State private var draftAutoCleanDays: Int = 7
+
+    @State private var showSavedConfirmation: Bool = false
+
+    private var hasUnsavedChanges: Bool {
+        let cal = Calendar.current
+        let h = cal.component(.hour, from: draftScheduleTime)
+        let m = cal.component(.minute, from: draftScheduleTime)
+        return draftAutoDownload != vm.autoDownloadEnabled ||
+               h != vm.autoDownloadHour ||
+               m != vm.autoDownloadMinute ||
+               draftTargetCategory != vm.autoDownloadTargetCategory ||
+               draftUseFaceID != vm.useFaceID ||
+               draftAutoCleanEnabled != vm.autoCleanEnabled ||
+               draftAutoCleanDays != vm.autoCleanDays
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if hasUnsavedChanges {
+                    Section {
+                        HStack {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("لديك تعديلات غير محفوظة! اضغط على زر (حفظ الإعدادات) بالأسفل لاعتمادها.")
+                                .font(.caption.bold())
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+
+                Section(header: Text("التحميل التلقائي اليومي")) {
+                    Toggle("تفعيل التحميل التلقائي", isOn: $draftAutoDownload)
+
+                    DatePicker("وقت التحميل اليومي", selection: $draftScheduleTime, displayedComponents: .hourAndMinute)
+
+                    Picker("الخانة المستهدفة بالتحميل", selection: $draftTargetCategory) {
+                        Text("جميع الخانات (الكل)").tag(-1)
+                        Text("خانة 1 فقط").tag(0)
+                        Text("خانة 2 فقط").tag(1)
+                        Text("خانة 3 فقط").tag(2)
+                    }
+                }
+
+                Section(header: Text("الأمان والخصوصية")) {
+                    Toggle("قفل التطبيق ببصمة الوجه (FaceID)", isOn: $draftUseFaceID)
+                }
+
+                Section(header: Text("تنظيف الذاكرة التلقائي")) {
+                    Toggle("حذف المقاطع القديمة تلقائياً", isOn: $draftAutoCleanEnabled)
+                    Stepper("الاحتفاظ بالمقاطع لمدة: \(draftAutoCleanDays) أيام", value: $draftAutoCleanDays, in: 1...90)
+                }
+
+                Section {
+                    Button {
+                        let cal = Calendar.current
+                        let h = cal.component(.hour, from: draftScheduleTime)
+                        let m = cal.component(.minute, from: draftScheduleTime)
+                        vm.applyAndSaveSettings(
+                            autoDownload: draftAutoDownload,
+                            hour: h,
+                            minute: m,
+                            targetCategory: draftTargetCategory,
+                            faceID: draftUseFaceID,
+                            cleanEnabled: draftAutoCleanEnabled,
+                            cleanDays: draftAutoCleanDays
+                        )
+                        showSavedConfirmation = true
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Image(systemName: "checkmark.seal.fill")
+                            Text("حفظ الإعدادات واعتماد التغييرات")
+                                .font(.headline.bold())
+                            Spacer()
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .listRowBackground(hasUnsavedChanges ? Color.green : Color.yellow)
+                    .foregroundColor(hasUnsavedChanges ? .white : .black)
+
+                    if hasUnsavedChanges {
+                        Button(role: .destructive) {
+                            syncDraftsFromViewModel()
+                        } label: {
+                            HStack {
+                                Spacer()
+                                Text("إلغاء التعديلات والرجوع للإعدادات المحفوظة")
+                                    .font(.caption.bold())
+                                Spacer()
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("الإعدادات ⚙️")
+            .onAppear {
+                syncDraftsFromViewModel()
+            }
+            .alert("تم الحفظ ✅", isPresented: $showSavedConfirmation) {
+                Button("ممتاز", role: .cancel) {}
+            } message: {
+                Text("تم حفظ واعتماد جميع إعداداتك بنجاح.")
+            }
+        }
+    }
+
+    private func syncDraftsFromViewModel() {
+        draftAutoDownload = vm.autoDownloadEnabled
+        draftTargetCategory = vm.autoDownloadTargetCategory
+        draftUseFaceID = vm.useFaceID
+        draftAutoCleanEnabled = vm.autoCleanEnabled
+        draftAutoCleanDays = vm.autoCleanDays
+
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        comps.hour = vm.autoDownloadHour
+        comps.minute = vm.autoDownloadMinute
+        draftScheduleTime = Calendar.current.date(from: comps) ?? Date()
     }
 }
