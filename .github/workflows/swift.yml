@@ -162,7 +162,7 @@ jobs:
             sources:
               - Sources
             info:
-              path: Sources/Info.plist
+              path: Info.plist
               properties:
                 CFBundleDisplayName: SnapVault
                 UILaunchScreen: {}
