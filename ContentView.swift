@@ -859,7 +859,6 @@ class VaultViewModel: ObservableObject {
                 if Task.isCancelled { break }
 
                 while isPaused && !Task.isCancelled {
-                    progressText = "⏸️ متوقف مؤقتاً عند @\(acc.username) (\(index + 1)/\(targetAccounts.count))"
                     try? await Task.sleep(nanoseconds: 400_000_000)
                 }
                 if Task.isCancelled { break }
@@ -904,7 +903,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل المحدث (تصفية صورة البروفايل واستخراج روابط الستوري الحقيقية حصرياً)
+    // MARK: - محرك التحميل الحصري للستوريات (تجاهل تام لصور البروفايل والأيقونات)
 
     private struct StorySnapInfo {
         let id: String
@@ -945,13 +944,21 @@ class VaultViewModel: ObservableObject {
                 snaps = parseStoryOnlyFromNextData(rootObj)
             }
 
-            // فحص احتياطي مع تصفية صورة البروفايل الثابتة لضمان جلب الستوريات فقط
             if snaps.isEmpty {
                 snaps = parseSnapsFallbackFromHTML(html)
             }
 
-            if snaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على ستوريات عامة نشطة"]))
+            // تصفية قوية جداً لاستبعاد صور الملف الشخصي، الأيقونات الثابتة، أو أي صور مصغرة
+            let validSnaps = snaps.filter { snap in
+                let lower = snap.mediaUrl.lowercased()
+                if lower.contains("bitmoji") || lower.contains("avatar") || lower.contains("icon") || lower.contains("profile") || lower.contains("header") || lower.contains("logo") {
+                    return false
+                }
+                return true
+            }
+
+            if validSnaps.isEmpty {
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لا توجد ستوريات يومية نشطة حالياً"]))
             }
 
             let folderURL = accountFolder(for: username)
@@ -959,7 +966,7 @@ class VaultViewModel: ObservableObject {
             var savedCount = 0
             var newlyAddedItems: [MediaItem] = []
 
-            for snap in snaps {
+            for snap in validSnaps {
                 if Task.isCancelled { break }
                 while isPaused && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 400_000_000)
@@ -985,6 +992,11 @@ class VaultViewModel: ObservableObject {
 
                 let (mediaData, mediaResp) = try await downloadSession.data(for: mediaReq)
                 if let httpMedia = mediaResp as? HTTPURLResponse, httpMedia.statusCode == 200, !mediaData.isEmpty {
+                    // شرط إضافي: الستوريات الحقيقية أو الفيديوهات حجمها أكبر من صور البروفايل والأيقونات
+                    if !snap.isVideo && mediaData.count < 15000 {
+                        continue // تخطي أي صورة صغيرة أو رمز بروفايل متبقي
+                    }
+
                     try mediaData.write(to: fileURL, options: .atomic)
                     let snapDate = Date(timeIntervalSince1970: preciseTimestamp)
                     try? FileManager.default.setAttributes(
@@ -1060,15 +1072,14 @@ class VaultViewModel: ObservableObject {
         for (idx, match) in matches.enumerated() {
             if let range = Range(match.range(at: 1), in: html) {
                 let mediaUrl = String(html[range])
-                // تصفية واستبعاد صورة البروفايل أو الأيقونات الثابتة عبر فحص الكلمات المفتاحية للستوري
-                let lowerUrl = mediaUrl.lowercased()
+                let lower = mediaUrl.lowercased()
                 guard mediaUrl.contains("snapchat") && !seenUrls.contains(mediaUrl) else { continue }
-                if lowerUrl.contains("bitmoji") || lowerUrl.contains("avatar") || lowerUrl.contains("icon") || lowerUrl.contains("profile") {
+                if lower.contains("bitmoji") || lower.contains("avatar") || lower.contains("icon") || lower.contains("profile") || lower.contains("header") {
                     continue
                 }
                 seenUrls.insert(mediaUrl)
 
-                let isVideo = lowerUrl.contains(".mp4")
+                let isVideo = lower.contains(".mp4")
                 let snapId = URL(string: mediaUrl)?.lastPathComponent ?? UUID().uuidString
                 let timestamp = Date().timeIntervalSince1970
 
