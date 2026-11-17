@@ -948,7 +948,6 @@ class VaultViewModel: ObservableObject {
                 snaps = parseSnapsFallbackFromHTML(html)
             }
 
-            // تصفية قوية جداً لاستبعاد صور الملف الشخصي، الأيقونات الثابتة، أو أي صور مصغرة
             let validSnaps = snaps.filter { snap in
                 let lower = snap.mediaUrl.lowercased()
                 if lower.contains("bitmoji") || lower.contains("avatar") || lower.contains("icon") || lower.contains("profile") || lower.contains("header") || lower.contains("logo") {
@@ -958,7 +957,7 @@ class VaultViewModel: ObservableObject {
             }
 
             if validSnaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لا توجد ستوريات يومية نشطة حالياً"]))
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على ستوريات نشطة لهذا الحساب"]))
             }
 
             let folderURL = accountFolder(for: username)
@@ -992,9 +991,8 @@ class VaultViewModel: ObservableObject {
 
                 let (mediaData, mediaResp) = try await downloadSession.data(for: mediaReq)
                 if let httpMedia = mediaResp as? HTTPURLResponse, httpMedia.statusCode == 200, !mediaData.isEmpty {
-                    // شرط إضافي: الستوريات الحقيقية أو الفيديوهات حجمها أكبر من صور البروفايل والأيقونات
                     if !snap.isVideo && mediaData.count < 15000 {
-                        continue // تخطي أي صورة صغيرة أو رمز بروفايل متبقي
+                        continue 
                     }
 
                     try mediaData.write(to: fileURL, options: .atomic)
