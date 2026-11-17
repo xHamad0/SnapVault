@@ -12,7 +12,7 @@ import ImageIO
 struct SnapAccount: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var username: String
-    var category: Int = 0 // 0: خانة 1, 1: خانة 2, 2: خانة 3
+    var category: Int = 0 
     var isSelectedForDownload: Bool = true
 
     enum CodingKeys: String, CodingKey {
@@ -904,7 +904,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل المطور (يدعم __NEXT_DATA__ مع الفحص الاحتياطي لتجاوز حماية سناب)
+    // MARK: - محرك التحميل المحدث (تصفية صورة البروفايل واستخراج روابط الستوري الحقيقية حصرياً)
 
     private struct StorySnapInfo {
         let id: String
@@ -945,7 +945,7 @@ class VaultViewModel: ObservableObject {
                 snaps = parseStoryOnlyFromNextData(rootObj)
             }
 
-            // الفحص الاحتياطي الذكي في حال حجب __NEXT_DATA__
+            // فحص احتياطي مع تصفية صورة البروفايل الثابتة لضمان جلب الستوريات فقط
             if snaps.isEmpty {
                 snaps = parseSnapsFallbackFromHTML(html)
             }
@@ -1060,10 +1060,15 @@ class VaultViewModel: ObservableObject {
         for (idx, match) in matches.enumerated() {
             if let range = Range(match.range(at: 1), in: html) {
                 let mediaUrl = String(html[range])
+                // تصفية واستبعاد صورة البروفايل أو الأيقونات الثابتة عبر فحص الكلمات المفتاحية للستوري
+                let lowerUrl = mediaUrl.lowercased()
                 guard mediaUrl.contains("snapchat") && !seenUrls.contains(mediaUrl) else { continue }
+                if lowerUrl.contains("bitmoji") || lowerUrl.contains("avatar") || lowerUrl.contains("icon") || lowerUrl.contains("profile") {
+                    continue
+                }
                 seenUrls.insert(mediaUrl)
 
-                let isVideo = mediaUrl.lowercased().contains(".mp4")
+                let isVideo = lowerUrl.contains(".mp4")
                 let snapId = URL(string: mediaUrl)?.lastPathComponent ?? UUID().uuidString
                 let timestamp = Date().timeIntervalSince1970
 
