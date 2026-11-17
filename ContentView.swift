@@ -58,7 +58,7 @@ struct PlayerSession: Identifiable {
     let startIndex: Int
 }
 
-// MARK: - 2. فاحص الشبكة (لخيار التحميل عبر Wi-Fi فقط)
+// MARK: - 2. فاحص الشبكة
 
 final class NetworkMonitor: @unchecked Sendable {
     static let shared = NetworkMonitor()
@@ -73,7 +73,7 @@ final class NetworkMonitor: @unchecked Sendable {
     }
 }
 
-// MARK: - 3. كاش الصور المصغرة على القرص والرام (لحل ثقل الـ 2000+ ملف نهائياً)
+// MARK: - 3. كاش الصور المصغرة
 
 final class ThumbnailCacheManager: @unchecked Sendable {
     static let shared = ThumbnailCacheManager()
@@ -202,7 +202,7 @@ final class ThumbnailCacheManager: @unchecked Sendable {
     }
 }
 
-// MARK: - 4. محرك البقاء نشطاً في الخلفية (مطور ومضاد لتوقف التحميل عند الخروج)
+// MARK: - 4. محرك البقاء في الخلفية
 
 final class BackgroundKeepAliveManager: NSObject, @unchecked Sendable {
     static let shared = BackgroundKeepAliveManager()
@@ -358,7 +358,7 @@ final class BackgroundKeepAliveManager: NSObject, @unchecked Sendable {
     }
 }
 
-// MARK: - 5. دمج الفيديوهات (Video Merger Engine)
+// MARK: - 5. دمج الفيديوهات
 
 enum VideoMergerEngine {
     static func mergeVideos(items: [MediaItem], progressHandler: @escaping @Sendable (String) -> Void) async throws -> URL {
@@ -431,7 +431,7 @@ enum VideoMergerEngine {
     }
 }
 
-// MARK: - 6. ViewModel (المحرك الأساسي + الفهرس السريع + جميع التعديلات الـ 12)
+// MARK: - 6. ViewModel
 
 @MainActor
 class VaultViewModel: ObservableObject {
@@ -454,11 +454,16 @@ class VaultViewModel: ObservableObject {
 
     private lazy var downloadSession: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 35
+        config.timeoutIntervalForRequest = 40
         config.timeoutIntervalForResource = 180
         config.waitsForConnectivity = true
         config.httpMaximumConnectionsPerHost = 4
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+        ]
         return URLSession(configuration: config)
     }()
 
@@ -501,8 +506,6 @@ class VaultViewModel: ObservableObject {
             logs.removeLast()
         }
     }
-
-    // MARK: - حفظ دائم للحسابات ضد الضياع عند التحديث + نسخ واستعادة
 
     private var accountsBackupFileURL: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -686,7 +689,6 @@ class VaultViewModel: ObservableObject {
         saveAccounts()
     }
 
-    // MARK: - إدارة الإعدادات
     func loadSettings() {
         let d = UserDefaults.standard
         autoDownloadEnabled = d.bool(forKey: "SV_AutoDownloadEnabled")
@@ -789,7 +791,6 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - أوامر التحميل
     func startDownloadAll() {
         let targets = allSelectedAccounts
         startBatchDownload(targetAccounts: targets, title: "الحسابات المحددة في جميع الخانات")
@@ -903,7 +904,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل الأساسي (__NEXT_DATA__) - للستوري فقط + منع التكرار 100% + ترتيب زمني دقيق
+    // MARK: - محرك التحميل المطور (يدعم __NEXT_DATA__ مع الفحص الاحتياطي لتجاوز حماية سناب)
 
     private struct StorySnapInfo {
         let id: String
@@ -920,12 +921,12 @@ class VaultViewModel: ObservableObject {
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        request.setValue(
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            forHTTPHeaderField: "User-Agent"
-        )
-        request.setValue("ar,en-US;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+        request.timeoutInterval = 40
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
+        request.setValue("https://www.snapchat.com", forHTTPHeaderField: "Referer")
+        request.setValue("keep-alive", forHTTPHeaderField: "Connection")
 
         do {
             let (data, response) = try await downloadSession.data(for: request)
@@ -937,15 +938,20 @@ class VaultViewModel: ObservableObject {
                 return .failure(NSError(domain: "SnapVault", code: 2, userInfo: [NSLocalizedDescriptionKey: "تعذر قراءة صفحة الحساب"]))
             }
 
-            guard let jsonString = extractNextDataJSON(from: html),
-                  let jsonData = jsonString.data(using: .utf8),
-                  let rootObj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-                return .failure(NSError(domain: "SnapVault", code: 3, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على بيانات __NEXT_DATA__"]))
+            var snaps: [StorySnapInfo] = []
+            if let jsonString = extractNextDataJSON(from: html),
+               let jsonData = jsonString.data(using: .utf8),
+               let rootObj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                snaps = parseStoryOnlyFromNextData(rootObj)
             }
 
-            let snaps = parseStoryOnlyFromNextData(rootObj)
+            // الفحص الاحتياطي الذكي في حال حجب __NEXT_DATA__
             if snaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لا توجد ستوريات يومية نشطة حالياً"]))
+                snaps = parseSnapsFallbackFromHTML(html)
+            }
+
+            if snaps.isEmpty {
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على ستوريات عامة نشطة"]))
             }
 
             let folderURL = accountFolder(for: username)
@@ -961,10 +967,7 @@ class VaultViewModel: ObservableObject {
                 if Task.isCancelled { break }
 
                 let safeID = Self.sanitizeSnapID(snap.id)
-
-                if knownIDs.contains(safeID) {
-                    continue
-                }
+                if knownIDs.contains(safeID) { continue }
 
                 let ext = snap.isVideo ? "mp4" : "jpg"
                 let preciseTimestamp = snap.timestamp + (Double(snap.sequenceIndex) * 0.001)
@@ -977,7 +980,10 @@ class VaultViewModel: ObservableObject {
                 }
 
                 guard let mediaURL = URL(string: snap.mediaUrl) else { continue }
-                let (mediaData, mediaResp) = try await downloadSession.data(from: mediaURL)
+                var mediaReq = URLRequest(url: mediaURL)
+                mediaReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+
+                let (mediaData, mediaResp) = try await downloadSession.data(for: mediaReq)
                 if let httpMedia = mediaResp as? HTTPURLResponse, httpMedia.statusCode == 200, !mediaData.isEmpty {
                     try mediaData.write(to: fileURL, options: .atomic)
                     let snapDate = Date(timeIntervalSince1970: preciseTimestamp)
@@ -1041,6 +1047,35 @@ class VaultViewModel: ObservableObject {
             }
         }
 
+        return results
+    }
+
+    private func parseSnapsFallbackFromHTML(_ html: String) -> [StorySnapInfo] {
+        var results: [StorySnapInfo] = []
+        let pattern = #"(https://[^""'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^""'<>]*)?)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return results }
+        let matches = regex.matches(in: html, options: [], range: NSRange(html.startIndex..., in: html))
+
+        var seenUrls = Set<String>()
+        for (idx, match) in matches.enumerated() {
+            if let range = Range(match.range(at: 1), in: html) {
+                let mediaUrl = String(html[range])
+                guard mediaUrl.contains("snapchat") && !seenUrls.contains(mediaUrl) else { continue }
+                seenUrls.insert(mediaUrl)
+
+                let isVideo = mediaUrl.lowercased().contains(".mp4")
+                let snapId = URL(string: mediaUrl)?.lastPathComponent ?? UUID().uuidString
+                let timestamp = Date().timeIntervalSince1970
+
+                results.append(StorySnapInfo(
+                    id: snapId,
+                    mediaUrl: mediaUrl,
+                    isVideo: isVideo,
+                    timestamp: timestamp,
+                    sequenceIndex: idx
+                ))
+            }
+        }
         return results
     }
 
@@ -1113,7 +1148,7 @@ class VaultViewModel: ObservableObject {
         return set
     }
 
-    // MARK: - محرك الفهرسة السريع في الخلفية
+    // MARK: - الفهرسة والإدارة
 
     var baseVaultDirectory: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -2376,7 +2411,7 @@ struct MediaThumbnailCell: View {
     }
 }
 
-// MARK: - 11. مشغل الصور والفيديو الخفيف (Windowed Pager + 2x يسار الشاشة + تكبير بإصبعين)
+// MARK: - 11. مشغل الصور والفيديو
 
 struct SwipeableMediaPlayerView: View {
     @ObservedObject var vm: VaultViewModel
@@ -2645,7 +2680,6 @@ struct SingleMediaPageView: View {
                     }
                 }
 
-                // منطقة الجهة اليسرى لتسريع الفيديو 2x عند الضغط المطول
                 if item.isVideo {
                     HStack(spacing: 0) {
                         Color.white.opacity(0.001)
