@@ -903,7 +903,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل الحصري للستوريات (تجاهل تام لصور البروفايل والأيقونات)
+    // MARK: - محرك التحميل المحدث (تحميل البروفايل + الستوريات اليومية معاً وبدون فقدان شيء)
 
     private struct StorySnapInfo {
         let id: String
@@ -948,16 +948,8 @@ class VaultViewModel: ObservableObject {
                 snaps = parseSnapsFallbackFromHTML(html)
             }
 
-            let validSnaps = snaps.filter { snap in
-                let lower = snap.mediaUrl.lowercased()
-                if lower.contains("bitmoji") || lower.contains("avatar") || lower.contains("icon") || lower.contains("profile") || lower.contains("header") || lower.contains("logo") {
-                    return false
-                }
-                return true
-            }
-
-            if validSnaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على ستوريات نشطة لهذا الحساب"]))
+            if snaps.isEmpty {
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على وسائط نشطة لهذا الحساب"]))
             }
 
             let folderURL = accountFolder(for: username)
@@ -965,7 +957,7 @@ class VaultViewModel: ObservableObject {
             var savedCount = 0
             var newlyAddedItems: [MediaItem] = []
 
-            for snap in validSnaps {
+            for snap in snaps {
                 if Task.isCancelled { break }
                 while isPaused && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 400_000_000)
@@ -991,10 +983,6 @@ class VaultViewModel: ObservableObject {
 
                 let (mediaData, mediaResp) = try await downloadSession.data(for: mediaReq)
                 if let httpMedia = mediaResp as? HTTPURLResponse, httpMedia.statusCode == 200, !mediaData.isEmpty {
-                    if !snap.isVideo && mediaData.count < 15000 {
-                        continue 
-                    }
-
                     try mediaData.write(to: fileURL, options: .atomic)
                     let snapDate = Date(timeIntervalSince1970: preciseTimestamp)
                     try? FileManager.default.setAttributes(
@@ -1070,14 +1058,10 @@ class VaultViewModel: ObservableObject {
         for (idx, match) in matches.enumerated() {
             if let range = Range(match.range(at: 1), in: html) {
                 let mediaUrl = String(html[range])
-                let lower = mediaUrl.lowercased()
                 guard mediaUrl.contains("snapchat") && !seenUrls.contains(mediaUrl) else { continue }
-                if lower.contains("bitmoji") || lower.contains("avatar") || lower.contains("icon") || lower.contains("profile") || lower.contains("header") {
-                    continue
-                }
                 seenUrls.insert(mediaUrl)
 
-                let isVideo = lower.contains(".mp4")
+                let isVideo = mediaUrl.lowercased().contains(".mp4")
                 let snapId = URL(string: mediaUrl)?.lastPathComponent ?? UUID().uuidString
                 let timestamp = Date().timeIntervalSince1970
 
@@ -2342,7 +2326,7 @@ struct AccountMediaDetailView: View {
                 }
             }) { success, _ in
                 Task { @MainActor in
-                    statusAlertMessage = success ? "تم الحفظ في ألبوم الكاميرا ✅" : "تعذر الحفظ في الألبوم"
+                    statusAlertMessage = success ? "تم الحفظ في ألبوم الكاميرا ✅" : "تعذر الحفظ"
                 }
             }
         }
