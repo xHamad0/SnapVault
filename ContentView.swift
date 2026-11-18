@@ -872,9 +872,9 @@ class VaultViewModel: ObservableObject {
                 case .success(let savedCount):
                     failedAccounts.removeAll { $0.account.username.lowercased() == acc.username.lowercased() }
                     if savedCount > 0 {
-                        appendLog("✅ @\(acc.username): تم حفظ \(savedCount) ستوري جديد")
+                        appendLog("✅ @\(acc.username): تم حفظ \(savedCount) مقطع جديد")
                     } else {
-                        appendLog("ℹ️ @\(acc.username): لا توجد ستوريات جديدة (محدث)")
+                        appendLog("ℹ️ @\(acc.username): لا توجد مقاطع جديدة (محدث)")
                     }
                 case .failure(let err):
                     let reason = err.localizedDescription
@@ -903,7 +903,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل المحدث (تحميل البروفايل + الستوريات اليومية معاً وبدون فقدان شيء)
+    // MARK: - محرك التحميل المستهدف للقصص اليومية ومنصة الأضواء
 
     private struct StorySnapInfo {
         let id: String
@@ -944,12 +944,16 @@ class VaultViewModel: ObservableObject {
                 snaps = parseStoryOnlyFromNextData(rootObj)
             }
 
-            if snaps.isEmpty {
-                snaps = parseSnapsFallbackFromHTML(html)
+            // استخراج محتوى البطاقات النشطة ومنصة الأضواء والستوريات التي تحمل علامة الساعة
+            let fallbackSnaps = parseSnapsFallbackFromHTML(html)
+            for item in fallbackSnaps {
+                if !snaps.contains(where: { $0.mediaUrl == item.mediaUrl }) {
+                    snaps.append(item)
+                }
             }
 
             if snaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على وسائط نشطة لهذا الحساب"]))
+                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على مقاطع نشطة لهذا الحساب"]))
             }
 
             let folderURL = accountFolder(for: username)
@@ -1050,6 +1054,7 @@ class VaultViewModel: ObservableObject {
 
     private func parseSnapsFallbackFromHTML(_ html: String) -> [StorySnapInfo] {
         var results: [StorySnapInfo] = []
+        // استهداف روابط الوسائط النشطة في بطاقات العرض والستوريات
         let pattern = #"(https://[^""'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^""'<>]*)?)"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return results }
         let matches = regex.matches(in: html, options: [], range: NSRange(html.startIndex..., in: html))
